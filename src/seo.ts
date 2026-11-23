@@ -26,7 +26,7 @@ declare const __DEEPSPACE_SITE_ORIGIN__: string | undefined
 
 export const seo = {
   title: APP_NAME,
-  description: `${APP_NAME} scores a repo's open GitHub issues for fit as a first bug-fix for your stack, then queues the best ones to triage.`,
+  description: `${APP_NAME} is a daily word-ladder game: turn the start word into the end word one letter at a time, and beat the true shortest path. No sign-in.`,
   /** Public origin for canonical URLs, og:url, and the sitemap — no trailing
    *  slash. Replace with the custom domain once one is attached, e.g.
    *  'https://www.example.com'. */

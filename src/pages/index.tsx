@@ -16,18 +16,20 @@ import { Link } from 'react-router-dom'
 import { Seo } from '../components/Seo'
 import { seo } from '../seo'
 
-const STEPS = [
+const EXAMPLE = ['COLD', 'WOLD', 'WORD', 'WARD', 'WARM']
+
+const RULES = [
   {
-    title: '1. Track a repo',
-    body: 'Paste any public GitHub repo and your stack — say, tiangolo/fastapi and Python, backend.',
+    title: '1. One letter at a time',
+    body: 'Change exactly one letter per step. Every step must be a real word — COLD → CORD is fine, COLD → COLT is too, but COLD → COLD is not a move.',
   },
   {
-    title: '2. Get issues scored',
-    body: 'Issue Radar pulls the repo\u2019s open issues and scores each one for fit as a first bug-fix, with an AI judge on the best fits and a deterministic score as fallback.',
+    title: '2. Beat the par',
+    body: 'Every daily ladder has a true shortest path, computed by breadth-first search over the word graph. The par stays hidden until you finish — or give up.',
   },
   {
-    title: '3. Triage the best',
-    body: 'Work the queue highest-score first: open an issue on GitHub, save it for later, or dismiss it. Scans repeat hourly and a 9am digest emails new issues scored 70+.',
+    title: '3. One ladder a day',
+    body: 'Everyone gets the same puzzle each UTC day. Unlimited retries, best result counts. Streaks live on your device — no sign-in, ever.',
   },
 ]
 
@@ -40,36 +42,47 @@ export default function Landing() {
         className="flex min-h-screen flex-col items-center px-6 py-16 text-center"
       >
         <p className="mb-3 text-sm uppercase tracking-widest text-muted-foreground">
-          Issue Radar
+          Ladder
         </p>
         <h1 className="mb-4 max-w-2xl text-4xl font-bold tracking-tight text-foreground sm:text-5xl">
-          Find your first bug-fix, not just any issue
+          One ladder a day. Beat the par.
         </h1>
-        <p className="mb-8 max-w-md text-muted-foreground">
-          Issue Radar scores a repo&apos;s open GitHub issues for how well they fit
-          as a first contribution for your stack, then queues the best ones for
-          triage.
+        <p className="mb-6 max-w-md text-muted-foreground">
+          Turn the start word into the end word, changing one letter at a time.
+          A new shared puzzle every day — no sign-in, just the shortest path
+          standing between you and par.
         </p>
+        <div className="mb-8 flex items-center gap-1.5" aria-label="Example ladder: cold to warm in three steps">
+          {EXAMPLE.map((word, i) => (
+            <span key={word} className="flex items-center gap-1.5">
+              {i > 0 && <span className="text-muted-foreground">→</span>}
+              <span className="rounded-md border border-border bg-card px-2.5 py-1.5 font-mono text-sm font-bold tracking-widest text-foreground">
+                {word}
+              </span>
+            </span>
+          ))}
+          <span className="ml-2 text-sm font-medium text-emerald-600">par 4</span>
+        </div>
         <Link
-          to="/home"
+          to="/play"
           className="mb-12 inline-flex items-center gap-2 rounded-full bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90"
         >
-          Enter the app
+          Play today’s ladder
         </Link>
         <div className="grid w-full max-w-3xl gap-4 text-left sm:grid-cols-3">
-          {STEPS.map((step) => (
+          {RULES.map((rule) => (
             <div
-              key={step.title}
+              key={rule.title}
               className="rounded-lg border border-border bg-card p-4"
             >
-              <h2 className="mb-1 text-sm font-semibold text-foreground">{step.title}</h2>
-              <p className="text-sm text-muted-foreground">{step.body}</p>
+              <h2 className="mb-1 text-sm font-semibold text-foreground">{rule.title}</h2>
+              <p className="text-sm text-muted-foreground">{rule.body}</p>
             </div>
           ))}
         </div>
         <p className="mt-10 max-w-md text-sm text-muted-foreground">
-          No repo in mind? Start with <code>tiangolo/fastapi</code> — sign in with
-          GitHub or Google and your first scan runs right away.
+          Finished the daily? Practice mode deals unlimited random ladders —
+          same rules, no leaderboard.
         </p>
       </div>
     </>

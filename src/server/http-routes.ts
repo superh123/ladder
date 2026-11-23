@@ -103,8 +103,8 @@ export function registerAuthAndIntegrationRoutes(app: Hono<AppContext>): void {
     const appOrigin = new URL(c.req.url).origin
     // Land the signed-in user in the app, not on the static landing. `/` is a
     // static page (no auth/realtime providers), so redirecting there after auth
-    // would strand the user; `/home` is the dynamic app boundary.
-    const appHome = `${appOrigin}/home`
+    // would strand the user; `/play` is the dynamic app boundary.
+    const appHome = `${appOrigin}/play`
 
     if (!code) return c.redirect(appHome)
 
@@ -423,7 +423,7 @@ export function registerStaticRoutes(app: Hono<AppContext>): void {
       return c.json({ error: 'not_found' }, 404)
     }
     // Once the prerender has run, `/` is the landing page, not an empty
-    // shell — serving it for /home would paint the landing for a frame and
+    // shell — serving it for /play would paint the landing for a frame and
     // hand crawlers the `/` canonical on every app route. Ask for the plain
     // shell the build writes first; a build without it (plain SPA,
     // `deepspace dev`) misses and falls through to `/` exactly as before.
