@@ -15,8 +15,10 @@ import {
   dailyPairFor,
   diffIndex,
   isGuessWord,
+  isPresentableWord,
   ladderNumberFor,
   nextStepOnShortestPath,
+  preferredPath,
   validatePath,
   validateStep,
 } from './ladder'
@@ -50,6 +52,11 @@ describe('bfs', () => {
       expect(dist).toBeGreaterThanOrEqual(4)
       expect(dist).toBeLessThanOrEqual(6)
       expect(pathCount).toBeGreaterThanOrEqual(2)
+      // And the path the player is shown must be presentable words only.
+      const shown = preferredPath(start, end)
+      expect(shown).not.toBeNull()
+      expect(shown!.length - 1).toBe(dist)
+      for (const word of shown!) expect(isPresentableWord(word)).toBe(true)
     }
   })
 })
@@ -99,7 +106,7 @@ describe('validatePath', () => {
   })
 
   it('rejects a path with a bad rung', () => {
-    const result = validatePath('cold', 'warm', ['cold', 'cork', 'word', 'warm'])
+    const result = validatePath('cold', 'warm', ['cold', 'xqzw', 'word', 'warm'])
     expect(result.ok).toBe(false)
     expect(result.error).toContain('Not in dictionary')
   })
@@ -134,5 +141,26 @@ describe('hints', () => {
 
   it('returns null at the end word', () => {
     expect(nextStepOnShortestPath('warm', 'warm')).toBeNull()
+  })
+})
+
+describe('preferredPath', () => {
+  it('returns a shortest path (length == par)', () => {
+    const { dist } = bfs('cold', 'warm')
+    const path = preferredPath('cold', 'warm')
+    expect(path).not.toBeNull()
+    expect(path!.length - 1).toBe(dist)
+    expect(path![0]).toBe('cold')
+    expect(path![path!.length - 1]).toBe('warm')
+  })
+
+  it('routes through presentable words when a clean shortest path exists', () => {
+    // lets -> user has no clean shortest path (every par-6 line runs
+    // through 'ssed'), so the bank rejects such pairs; a banked pair's
+    // preferred path must be presentable end to end.
+    const [start, end] = DAILY_PAIRS[1]
+    const path = preferredPath(start, end)
+    expect(path).not.toBeNull()
+    for (const word of path!) expect(isPresentableWord(word)).toBe(true)
   })
 })

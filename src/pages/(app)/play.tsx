@@ -375,7 +375,7 @@ export default function PlayPage() {
     }
   }
 
-  async function useHint() {
+  async function requestHint() {
     if (!pair || phase !== 'playing' || hintBusy) return
     const current = path[path.length - 1]
     if (current === pair.end) return
@@ -669,7 +669,7 @@ export default function PlayPage() {
                   )}
                 </div>
                 <div className="mt-3 flex gap-2">
-                  <Button variant="outline" size="sm" onClick={() => void useHint()} disabled={hintBusy}>
+                  <Button variant="outline" size="sm" onClick={() => void requestHint()} disabled={hintBusy}>
                     Hint
                   </Button>
                   <Button variant="outline" size="sm" onClick={() => void giveUp()}>

@@ -21,7 +21,7 @@ export const scoresSchema: CollectionSchema = {
     { name: 'name', storage: 'text', interpretation: 'plain' },
     { name: 'steps', storage: 'number', interpretation: 'plain' },
     { name: 'seconds', storage: 'number', interpretation: 'plain' },
-    { name: 'seeded', storage: 'boolean', interpretation: 'plain' },
+    { name: 'seeded', storage: 'number', interpretation: 'plain' },
     { name: 'createdAt', storage: 'text', interpretation: 'plain' },
   ],
   permissions: {

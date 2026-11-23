@@ -9,6 +9,7 @@
 
 import { WORDS_COMMON } from './words-common.js'
 import { WORDS_GUESS } from './words-guess.js'
+import { WORDS_LEGIT } from './words-legit.js'
 import { DAILY_PAIRS } from './daily-pairs.js'
 
 export const EPOCH_UTC = '2026-11-22'
@@ -87,13 +88,20 @@ export function neighbors(word: string, buckets: Buckets): string[] {
 
 const GUESS_BUCKETS = buildBuckets(WORDS_GUESS)
 const GUESS_SET = new Set<string>(WORDS_GUESS)
+const COMMON_SET = new Set<string>(WORDS_COMMON)
+const LEGIT_SET = new Set<string>(WORDS_LEGIT)
 
 export function isGuessWord(word: string): boolean {
   return GUESS_SET.has(word)
 }
 
 export function isCommonWord(word: string): boolean {
-  return (WORDS_COMMON as readonly string[]).includes(word)
+  return COMMON_SET.has(word)
+}
+
+/** True when `word` is presentable in a hint or an optimal-path reveal. */
+export function isPresentableWord(word: string): boolean {
+  return LEGIT_SET.has(word)
 }
 
 /** Index of the single differing letter, or -1 when the words differ by != 1 letter. */
@@ -178,27 +186,92 @@ export function nextStepOnShortestPath(
   end: string,
   buckets: Buckets = GUESS_BUCKETS,
 ): string | null {
-  if (current === end) return null
-  // Distances from the END: a neighbor of current is on a shortest path
-  // when its distance-to-end is exactly one less than current's.
-  const dist = new Map<string, number>([[end, 0]])
-  const queue: string[] = [end]
+  const path = preferredPath(current, end, buckets)
+  return path === null || path.length < 2 ? null : path[1]
+}
+
+/**
+ * BFS distances from `target` over the graph, optionally restricted to
+ * `allowed` words. A restricted BFS only walks edges between allowed
+ * words (the target itself is always included).
+ */
+function distancesTo(
+  target: string,
+  buckets: Buckets,
+  allowed?: ReadonlySet<string>,
+): Map<string, number> {
+  const dist = new Map<string, number>([[target, 0]])
+  const queue: string[] = [target]
   let head = 0
   while (head < queue.length) {
     const u = queue[head++]
     for (const v of neighbors(u, buckets)) {
-      if (!dist.has(v)) {
-        dist.set(v, (dist.get(u) ?? 0) + 1)
-        queue.push(v)
-      }
+      if (dist.has(v)) continue
+      if (allowed !== undefined && !allowed.has(v)) continue
+      dist.set(v, (dist.get(u) ?? 0) + 1)
+      queue.push(v)
     }
   }
-  const curDist = dist.get(current)
-  if (curDist === undefined) return null
-  for (const v of neighbors(current, buckets)) {
-    if (dist.get(v) === curDist - 1) return v
+  return dist
+}
+
+/**
+ * One shortest path from `start` to `end`, routed through presentable
+ * words whenever a shortest path of presentable words exists. The length
+ * is exactly the par (each step drops the distance-to-end by one); the
+ * preference only chooses *which* shortest path to show, so hints and the
+ * optimal-path reveal read like something a person would type instead of
+ * routing through an obscure dictionary word the guess list happens to
+ * contain. Falls back to the full guess graph when no presentable
+ * shortest path exists.
+ */
+export function preferredPath(
+  start: string,
+  end: string,
+  buckets: Buckets = GUESS_BUCKETS,
+): string[] | null {
+  if (start === end) return [start]
+  const { dist: par } = bfs(start, end, buckets)
+  if (par < 0) return null
+  // Try the presentable subgraph first: a clean shortest path exists
+  // exactly when its distance equals the par.
+  const clean = distancesTo(end, buckets, LEGIT_SET)
+  if (clean.get(start) === par) {
+    return walkPath(start, end, clean, buckets)
   }
-  return null
+  const full = distancesTo(end, buckets)
+  return walkPath(start, end, full, buckets)
+}
+
+/** Walk from `start` to `end`, always stepping to a word one closer. */
+function walkPath(
+  start: string,
+  end: string,
+  dist: Map<string, number>,
+  buckets: Buckets,
+): string[] | null {
+  const path = [start]
+  let cur = start
+  while (cur !== end) {
+    const curDist = dist.get(cur) ?? 0
+    const options = neighbors(cur, buckets).filter((v) => dist.get(v) === curDist - 1)
+    if (options.length === 0) return null
+    const next = pickPreferred(options)
+    if (next === null) return null
+    path.push(next)
+    cur = next
+  }
+  return path
+}
+
+/** Prefer a common word, then a presentable word, then the first candidate. */
+function pickPreferred(options: string[]): string | null {
+  if (options.length === 0) return null
+  return (
+    options.find((w) => isCommonWord(w)) ??
+    options.find((w) => isPresentableWord(w)) ??
+    options[0]
+  )
 }
 
 // ---------------------------------------------------------------------------

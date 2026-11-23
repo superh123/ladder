@@ -39,10 +39,6 @@ export function toNum(value: unknown, fallback = 0): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback
 }
 
-export function toBool(value: unknown): boolean {
-  return value === true
-}
-
 // ---------------------------------------------------------------------------
 // Leaderboard
 // ---------------------------------------------------------------------------
@@ -73,7 +69,7 @@ export async function readBoard(
         name: toStr(data.name),
         steps: toNum(data.steps, 0),
         seconds: toNum(data.seconds, 0),
-        seeded: toBool(data.seeded),
+        seeded: toNum(data.seeded, 0) === 1,
       } satisfies BoardEntry
     })
     .filter((e) => e.name && e.steps > 0)
@@ -145,7 +141,7 @@ export async function ensureSeeded(
   date: string,
 ): Promise<void> {
   const existing = await server.records.query('scores', {
-    where: { date, seeded: true },
+    where: { date, seeded: 1 },
     limit: 1,
   })
   if (existing.length > 0) return
@@ -156,7 +152,7 @@ export async function ensureSeeded(
       name: entry.name,
       steps: entry.steps,
       seconds: entry.seconds,
-      seeded: true,
+      seeded: 1,
       createdAt: nowIso,
     })
   }

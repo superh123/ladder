@@ -21,6 +21,7 @@ import {
   isValidDateStr,
   ladderNumberFor,
   nextStepOnShortestPath,
+  preferredPath,
   utcDateString,
   validatePath,
   validateStep,
@@ -31,7 +32,6 @@ import {
   readBoard,
   rowData,
   rowId,
-  toBool,
   toNum,
   toStr,
 } from './ladder.js'
@@ -132,7 +132,8 @@ export function registerLadderRoutes(app: Hono<AppContext>): void {
       return c.json({ valid: false, error: check.error }, 400)
     }
     const steps = check.steps ?? path.length - 1
-    const { path: optimalPath, dist: par } = bfs(start, end)
+    const { dist: par } = bfs(start, end)
+    const optimalPath = preferredPath(start, end) ?? []
     return c.json({
       valid: true,
       steps,
@@ -160,7 +161,8 @@ export function registerLadderRoutes(app: Hono<AppContext>): void {
     if (!/^[a-z]{4}$/.test(start) || !/^[a-z]{4}$/.test(end)) {
       return c.json({ par: -1, optimalPath: [] }, 400)
     }
-    const { path: optimalPath, dist: par } = bfs(start, end)
+    const { dist: par } = bfs(start, end)
+    const optimalPath = preferredPath(start, end) ?? []
     return c.json({ par, optimalPath })
   })
 
@@ -187,7 +189,8 @@ export function registerLadderRoutes(app: Hono<AppContext>): void {
     const steps = check.steps ?? path.length - 1
     const seconds = cleanSeconds(body.seconds)
     const hintsUsed = cleanHints(body.hintsUsed)
-    const { path: optimalPath, dist: par } = bfs(start, end)
+    const { dist: par } = bfs(start, end)
+    const optimalPath = preferredPath(start, end) ?? []
 
     const server = serverContext(c.env)
     const nowIso = new Date().toISOString()
@@ -200,7 +203,7 @@ export function registerLadderRoutes(app: Hono<AppContext>): void {
     let ownSeconds = Number.POSITIVE_INFINITY
     for (const row of existing) {
       const data = rowData(row)
-      if (toBool(data.seeded)) continue // seeded rows are never a player's own
+      if (toNum(data.seeded, 0) === 1) continue // seeded rows are never a player's own
       ownRecordId = rowId(row)
       ownSteps = toNum(data.steps, Number.POSITIVE_INFINITY)
       ownSeconds = toNum(data.seconds, Number.POSITIVE_INFINITY)
@@ -214,7 +217,7 @@ export function registerLadderRoutes(app: Hono<AppContext>): void {
         name,
         steps,
         seconds,
-        seeded: false,
+        seeded: 0,
         createdAt: nowIso,
       })
       isBest = true
