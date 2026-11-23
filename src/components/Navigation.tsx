@@ -1,16 +1,17 @@
 /**
  * Top nav — minimal placeholder bar wired to the app's mechanisms:
- * nav.ts-driven links (with role/dev filtering), sign-in via <AuthOverlay>,
- * and sign-out. Restyle or rebuild it freely; keep the data-testid hooks
- * (`app-navigation`, `nav-sign-in-button`, `nav-user-name`, `nav-user-email`)
- * — the shipped tests rely on them. `nav-user-email` is the one that carries
- * an identity the test can check exactly: a display name is optional, the
- * email is the credential the session was opened with.
+ * nav.ts-driven links (with role/dev filtering). Sign-in was removed by
+ * design: this app has no sign-in anywhere, so the nav never offers it.
+ * Keep the data-testid hooks (`app-navigation`, `nav-user-name`,
+ * `nav-user-email`) — the shipped tests rely on them. `nav-user-email` is
+ * the one that carries an identity the test can check exactly: a display
+ * name is optional, the email is the credential the session was opened
+ * with.
  */
 
 import { useState, useEffect } from 'react'
 import { Link, useLocation } from 'react-router-dom'
-import { AuthOverlay, useAuthProfileReady, signOut } from 'deepspace'
+import { useAuthProfileReady, signOut } from 'deepspace'
 import { ChevronDown, LogOut, Menu, X } from 'lucide-react'
 import { APP_NAME } from '../constants'
 import type { Role } from '../constants'
@@ -32,7 +33,6 @@ export default function Navigation() {
   const { isLoaded, isSignedIn, user, userLoading } = useAuthProfileReady({ requireUser: true })
   const location = useLocation()
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
-  const [showAuthModal, setShowAuthModal] = useState(false)
 
   const profileReady = !isSignedIn || (!userLoading && !!user)
   const userRole = (user?.role ?? 'anonymous') as Role | 'anonymous'
@@ -80,8 +80,7 @@ export default function Navigation() {
           <div className="flex-1" />
 
           {!isLoaded ? null : isSignedIn && !profileReady ? (
-            /* Signed in, profile still loading — skeleton pill, never the
-               Sign in button (that would offer sign-in to a signed-in user). */
+            /* Signed in, profile still loading — skeleton pill. */
             <div className="flex items-center gap-2 rounded-full border border-border bg-card/60 py-1 pl-1 pr-2.5">
               <div className="h-6 w-6 animate-pulse rounded-full bg-muted" />
               <div className="hidden h-4 w-20 animate-pulse rounded-md bg-muted sm:block" />
@@ -132,15 +131,7 @@ export default function Navigation() {
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
-          ) : (
-            <button
-              data-testid="nav-sign-in-button"
-              onClick={() => setShowAuthModal(true)}
-              className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:opacity-90"
-            >
-              Sign in
-            </button>
-          )}
+          ) : null}
 
           <button
             className="inline-flex h-8 w-8 items-center justify-center text-muted-foreground hover:text-foreground md:hidden"
@@ -158,8 +149,6 @@ export default function Navigation() {
           </div>
         )}
       </nav>
-
-      {showAuthModal && <AuthOverlay onClose={() => setShowAuthModal(false)} />}
     </>
   )
 }

@@ -28,7 +28,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { usePresenceRoom } from 'deepspace'
-import { Lock } from 'lucide-react'
+import { Lock, Search } from 'lucide-react'
 import { Button, Input } from '@/components/ui'
 import {
   bfs,
@@ -159,6 +159,69 @@ const BOT_LEVELS = {
     blurb: 'Plays the optimal path, but at a human pace. A fast, accurate run can edge it out.',
   },
 } as const
+
+/**
+ * Per-mode identity: accent color + one-line flavor. All class strings are
+ * full literals so Tailwind's scanner picks them up — do not build them
+ * dynamically from the mode name.
+ */
+const MODE_STYLE = {
+  daily: {
+    label: 'Daily',
+    flavor: 'Today’s shared ladder — one shot, then it’s done.',
+    pillActive:
+      'bg-emerald-500 text-white shadow-[0_2px_12px_rgba(16,185,129,0.45)]',
+    pillHover: 'hover:text-emerald-400',
+    accentText: 'text-emerald-500',
+    bar: 'bg-emerald-500',
+    changedTile:
+      'border-emerald-400 bg-emerald-500 text-white shadow-[0_0_14px_rgba(16,185,129,0.45)]',
+  },
+  practice: {
+    label: 'Practice',
+    flavor: 'Endless ladders. Zero pressure.',
+    pillActive: 'bg-sky-500 text-white shadow-[0_2px_12px_rgba(59,130,246,0.45)]',
+    pillHover: 'hover:text-sky-400',
+    accentText: 'text-sky-500',
+    bar: 'bg-sky-500',
+    changedTile:
+      'border-sky-400 bg-sky-500 text-white shadow-[0_0_14px_rgba(59,130,246,0.45)]',
+  },
+  bot: {
+    label: 'Bot',
+    flavor: 'Race the bot — first to the target wins.',
+    pillActive:
+      'bg-violet-500 text-white shadow-[0_2px_12px_rgba(139,92,246,0.45)]',
+    pillHover: 'hover:text-violet-400',
+    accentText: 'text-violet-500',
+    bar: 'bg-violet-500',
+    changedTile:
+      'border-violet-400 bg-violet-500 text-white shadow-[0_0_14px_rgba(139,92,246,0.45)]',
+  },
+  versus: {
+    label: '1v1',
+    flavor: 'Race a live opponent.',
+    pillActive: 'bg-amber-500 text-white shadow-[0_2px_12px_rgba(245,158,11,0.45)]',
+    pillHover: 'hover:text-amber-400',
+    accentText: 'text-amber-500',
+    bar: 'bg-amber-500',
+    changedTile:
+      'border-amber-400 bg-amber-500 text-white shadow-[0_0_14px_rgba(245,158,11,0.45)]',
+  },
+} as const
+
+/** Thin progress bar (0..1) for distance-left / par-rate visuals. */
+function MiniBar({ fraction, className }: { fraction: number; className: string }) {
+  const pct = Math.max(0, Math.min(100, Math.round(fraction * 100)))
+  return (
+    <div className="h-2 overflow-hidden rounded-full bg-muted">
+      <div
+        className={`h-full rounded-full transition-all duration-500 ${className}`}
+        style={{ width: `${pct}%` }}
+      />
+    </div>
+  )
+}
 
 type BotDifficulty = keyof typeof BOT_LEVELS
 
@@ -461,6 +524,14 @@ export default function PlayPage() {
           : versusPair
   const start = pair?.start ?? ''
   const end = pair?.end ?? ''
+
+  /** Shortest distance of the current pair — the denominator for the
+   * distance-left progress bars in the bot / 1v1 panels. (The number
+   * itself is never displayed, so the par stays hidden.) */
+  const startDist = useMemo(
+    () => (pair ? bfs(pair.start, pair.end).dist : null),
+    [pair],
+  )
 
   // The position locked for the next rung: the one changed on the last step.
   const prevWord = path.length > 0 ? path[path.length - 1] : ''
@@ -1337,57 +1408,28 @@ export default function PlayPage() {
             role="tablist"
             aria-label="Game mode"
           >
-            <button
-              role="tab"
-              aria-selected={mode === 'daily'}
-              onClick={() => switchMode('daily')}
-              className={
-                mode === 'daily'
-                  ? 'rounded-full bg-primary px-3 py-1 font-medium text-primary-foreground'
-                  : 'rounded-full px-3 py-1 text-muted-foreground hover:text-foreground'
-              }
-            >
-              Daily
-            </button>
-            <button
-              role="tab"
-              aria-selected={mode === 'practice'}
-              onClick={() => switchMode('practice')}
-              className={
-                mode === 'practice'
-                  ? 'rounded-full bg-primary px-3 py-1 font-medium text-primary-foreground'
-                  : 'rounded-full px-3 py-1 text-muted-foreground hover:text-foreground'
-              }
-            >
-              Practice
-            </button>
-            <button
-              role="tab"
-              aria-selected={mode === 'bot'}
-              onClick={() => switchMode('bot')}
-              className={
-                mode === 'bot'
-                  ? 'rounded-full bg-primary px-3 py-1 font-medium text-primary-foreground'
-                  : 'rounded-full px-3 py-1 text-muted-foreground hover:text-foreground'
-              }
-            >
-              Bot
-            </button>
-            <button
-              role="tab"
-              aria-selected={mode === 'versus'}
-              onClick={() => switchMode('versus')}
-              className={
-                mode === 'versus'
-                  ? 'rounded-full bg-primary px-3 py-1 font-medium text-primary-foreground'
-                  : 'rounded-full px-3 py-1 text-muted-foreground hover:text-foreground'
-              }
-            >
-              1v1
-            </button>
+            {(Object.keys(MODE_STYLE) as Mode[]).map((m) => (
+              <button
+                key={m}
+                role="tab"
+                aria-selected={mode === m}
+                onClick={() => switchMode(m)}
+                className={
+                  mode === m
+                    ? `rounded-full px-3 py-1 font-medium transition-all hover:scale-[1.04] active:scale-95 ${MODE_STYLE[m].pillActive}`
+                    : `rounded-full px-3 py-1 text-muted-foreground transition-all hover:scale-[1.04] active:scale-95 ${MODE_STYLE[m].pillHover}`
+                }
+              >
+                {MODE_STYLE[m].label}
+              </button>
+            ))}
           </div>
         </div>
       </div>
+
+      <p className={`-mt-3 mb-6 text-sm font-medium ${MODE_STYLE[mode].accentText}`}>
+        {MODE_STYLE[mode].flavor}
+      </p>
 
       {solvingNow !== null && (
         <p className="mb-4 text-sm text-muted-foreground">
@@ -1419,8 +1461,8 @@ export default function PlayPage() {
                 key={level}
                 type="button"
                 onClick={() => void startBotRound(level)}
-                className={`rounded-lg border p-4 text-left transition-colors hover:border-primary ${
-                  botDifficulty === level ? 'border-primary bg-primary/5' : 'border-border bg-background'
+                className={`rounded-lg border p-4 text-left transition-all hover:-translate-y-0.5 hover:border-violet-400 active:scale-[0.98] ${
+                  botDifficulty === level ? 'border-violet-500 bg-violet-500/10 shadow-[0_4px_20px_rgba(139,92,246,0.25)]' : 'border-border bg-background'
                 }`}
               >
                 <span className="block text-base font-semibold text-foreground">
@@ -1429,7 +1471,7 @@ export default function PlayPage() {
                 <span className="mt-1 block text-sm text-muted-foreground">
                   {BOT_LEVELS[level].blurb}
                 </span>
-                <span className="mt-3 block text-sm font-medium text-primary">Race →</span>
+                <span className="mt-3 block text-sm font-medium text-violet-400">Race →</span>
               </button>
             ))}
           </div>
@@ -1449,9 +1491,7 @@ export default function PlayPage() {
         <div className="rounded-lg border border-border bg-card p-5">
           <h2 className="text-lg font-semibold text-foreground">Race a live opponent</h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            Enter a name, join the queue, and race the first person who shows up. Same
-            ladder, first to the target wins — if you both finish, the shorter path wins.
-            No sign-in.
+            Enter a name, join the queue, and race the first person who shows up.
           </p>
           <div className="mt-3 flex gap-2">
             <Input
@@ -1462,7 +1502,7 @@ export default function PlayPage() {
               maxLength={20}
               className="h-10 flex-1"
             />
-            <Button onClick={joinVersusQueue}>Join queue</Button>
+            <Button onClick={joinVersusQueue} className="transition-transform hover:scale-[1.02] active:scale-95">Join queue</Button>
           </div>
           {versusQueueError && (
             <p className="mt-2 text-sm font-medium text-destructive">{versusQueueError}</p>
@@ -1475,7 +1515,20 @@ export default function PlayPage() {
           <h2 className="text-lg font-semibold text-foreground">
             In the queue as {versusName}
           </h2>
-          <p className="mt-1 text-sm text-muted-foreground">
+          {/* Searching visual — magnifier sweeping the ring, CSS only.
+              Shows only while waiting; the whole card unmounts on match. */}
+          <div className="mt-4 flex flex-col items-center gap-3" aria-hidden>
+            <div className="relative flex h-16 w-16 items-center justify-center">
+              <span className="absolute inset-0 rounded-full border border-amber-500/30" />
+              <span className="absolute inset-0 animate-ping rounded-full border border-amber-500/40 [animation-duration:2s]" />
+              <span className="animate-search-orbit absolute inset-0">
+                <Search className="absolute left-1/2 top-0 h-5 w-5 -translate-x-1/2 -translate-y-1/2 text-amber-400" />
+              </span>
+              <span className="h-2.5 w-2.5 rounded-full bg-amber-500" />
+            </div>
+            <p className="text-sm font-medium text-amber-500">Finding opponent…</p>
+          </div>
+          <p className="mt-3 text-sm text-muted-foreground">
             Waiting for an opponent…{' '}
             {versusQueueCount > 1
               ? `${versusQueueCount} in the queue right now.`
@@ -1546,9 +1599,9 @@ export default function PlayPage() {
                         {word.split('').map((ch, j) => (
                           <span
                             key={j}
-                            className={`relative flex h-10 w-10 items-center justify-center rounded-md border text-lg font-bold uppercase ${
+                            className={`relative flex h-11 w-11 items-center justify-center rounded-lg border-2 text-lg font-bold uppercase shadow-sm ${
                               j === changed
-                                ? 'border-primary bg-primary text-primary-foreground'
+                                ? MODE_STYLE[mode].changedTile
                                 : isLast
                                   ? 'border-border bg-card text-foreground'
                                   : 'border-border bg-muted/50 text-muted-foreground'
@@ -1580,7 +1633,7 @@ export default function PlayPage() {
                   {end.split('').map((ch, j) => (
                     <span
                       key={j}
-                      className="flex h-10 w-10 items-center justify-center rounded-md border border-dashed border-border text-lg font-bold uppercase text-muted-foreground"
+                      className="flex h-11 w-11 items-center justify-center rounded-lg border-2 border-dashed border-border text-lg font-bold uppercase text-muted-foreground"
                     >
                       {ch}
                     </span>
@@ -1620,7 +1673,10 @@ export default function PlayPage() {
                     aria-label="Next word in the ladder"
                     className="h-11 flex-1 font-mono text-lg uppercase tracking-[0.3em]"
                   />
-                  <Button onClick={() => void submitWord()} className="h-11">
+                  <Button
+                    onClick={() => void submitWord()}
+                    className="h-11 transition-transform hover:scale-[1.03] active:scale-95"
+                  >
                     Add
                   </Button>
                 </div>
@@ -1724,12 +1780,12 @@ export default function PlayPage() {
                 )}
                 {mode === 'practice' && (
                   <div className="mt-4">
-                    <Button onClick={playAgain}>Another practice ladder</Button>
+                    <Button onClick={playAgain} className="transition-transform hover:scale-[1.02] active:scale-95">Another practice ladder</Button>
                   </div>
                 )}
                 {result.gaveUp && (
                   <div className="mt-4">
-                    <Button onClick={playAgain}>Try again</Button>
+                    <Button onClick={playAgain} className="transition-transform hover:scale-[1.02] active:scale-95">Try again</Button>
                   </div>
                 )}
               </div>
@@ -1772,7 +1828,7 @@ export default function PlayPage() {
                   </div>
                 </div>
                 <div className="mt-4 flex flex-wrap gap-2">
-                  <Button onClick={playAgain}>Race again</Button>
+                  <Button onClick={playAgain} className="transition-transform hover:scale-[1.02] active:scale-95">Race again</Button>
                   <Button variant="outline" onClick={showBotPicker}>
                     Change difficulty
                   </Button>
@@ -1843,7 +1899,7 @@ export default function PlayPage() {
                   </div>
                 </div>
                 <div className="mt-4 flex flex-wrap gap-2">
-                  <Button onClick={playAgain}>Queue again</Button>
+                  <Button onClick={playAgain} className="transition-transform hover:scale-[1.02] active:scale-95">Queue again</Button>
                   <Button variant="outline" onClick={versusChangeName}>
                     Change name
                   </Button>
@@ -1868,7 +1924,11 @@ export default function PlayPage() {
                     maxLength={20}
                     className="h-10 flex-1"
                   />
-                  <Button onClick={() => void saveWithName()} disabled={saving || !name.trim()}>
+                  <Button
+                    onClick={() => void saveWithName()}
+                    disabled={saving || !name.trim()}
+                    className="transition-transform hover:scale-[1.02] active:scale-95"
+                  >
                     {saving ? 'Saving…' : 'Save score'}
                   </Button>
                 </div>
@@ -1888,15 +1948,25 @@ export default function PlayPage() {
                 <dl className="space-y-1.5 text-sm">
                   <div className="flex justify-between">
                     <dt className="text-muted-foreground">Bot steps</dt>
-                    <dd className="font-bold text-foreground">{botIndex}</dd>
+                    <dd className="text-base font-extrabold text-foreground">{botIndex}</dd>
                   </div>
                   <div className="flex justify-between">
                     <dt className="text-muted-foreground">Distance left</dt>
-                    <dd className="font-bold text-foreground">
+                    <dd className="text-base font-extrabold text-foreground">
                       {botDistLeft === null ? '—' : `${botDistLeft} to go`}
                     </dd>
                   </div>
                 </dl>
+                <div className="mt-2">
+                  <MiniBar
+                    fraction={
+                      startDist === null || botDistLeft === null
+                        ? 0
+                        : 1 - botDistLeft / startDist
+                    }
+                    className={MODE_STYLE.bot.bar}
+                  />
+                </div>
                 {phase === 'playing' && (
                   <p className="mt-3 flex items-center gap-1.5 text-xs text-muted-foreground">
                     <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-emerald-500" />
@@ -1915,17 +1985,27 @@ export default function PlayPage() {
                       <dl className="space-y-1.5 text-sm">
                         <div className="flex justify-between">
                           <dt className="text-muted-foreground">Steps</dt>
-                          <dd className="font-bold text-foreground">{versusOpp.steps}</dd>
+                          <dd className="text-base font-extrabold text-foreground">{versusOpp.steps}</dd>
                         </div>
                         <div className="flex justify-between">
                           <dt className="text-muted-foreground">Distance left</dt>
-                          <dd className="font-bold text-foreground">
+                          <dd className="text-base font-extrabold text-foreground">
                             {versusOpp.distance === null
                               ? '—'
                               : `${versusOpp.distance} to go`}
                           </dd>
                         </div>
                       </dl>
+                      <div className="mt-2">
+                        <MiniBar
+                          fraction={
+                            startDist === null || versusOpp.distance === null
+                              ? 0
+                              : 1 - versusOpp.distance / startDist
+                          }
+                          className={MODE_STYLE.versus.bar}
+                        />
+                      </div>
                       {phase === 'playing' && (
                         <p className="mt-3 flex items-center gap-1.5 text-xs text-muted-foreground">
                           <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-emerald-500" />
@@ -1966,6 +2046,9 @@ export default function PlayPage() {
                     <div>
                       <dt className="text-muted-foreground">Par rate</dt>
                       <dd className="text-lg font-bold text-foreground">{parRate}%</dd>
+                      <div className="mt-1.5">
+                        <MiniBar fraction={parRate / 100} className="bg-emerald-500" />
+                      </div>
                     </div>
                   </dl>
                   {mode === 'daily' && solvedToday ? (
