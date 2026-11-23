@@ -18,21 +18,6 @@ import { seo } from '../seo'
 
 const EXAMPLE = ['COLD', 'WOLD', 'WORD', 'WARD', 'WARM']
 
-const RULES = [
-  {
-    title: '1. One letter at a time',
-    body: 'Change exactly one letter per step. Every step must be a real word — COLD → CORD is fine, COLD → COLT is too, but COLD → COLD is not a move.',
-  },
-  {
-    title: '2. Beat the par',
-    body: 'Every daily ladder has a true shortest path, computed by breadth-first search over the word graph. The par stays hidden until you finish — or give up.',
-  },
-  {
-    title: '3. One ladder a day',
-    body: 'Everyone gets the same puzzle each UTC day. Unlimited retries, best result counts. Streaks live on your device — no sign-in, ever.',
-  },
-]
-
 export default function Landing() {
   return (
     <>
@@ -52,7 +37,7 @@ export default function Landing() {
           A new shared puzzle every day — no sign-in, just the shortest path
           standing between you and par.
         </p>
-        <div className="mb-8 flex items-center gap-1.5" aria-label="Example ladder: cold to warm in three steps">
+        <div className="mb-8 flex items-center gap-1.5" aria-label="Example ladder: cold to warm in four steps">
           {EXAMPLE.map((word, i) => (
             <span key={word} className="flex items-center gap-1.5">
               {i > 0 && <span className="text-muted-foreground">→</span>}
@@ -69,21 +54,6 @@ export default function Landing() {
         >
           Play today’s ladder
         </Link>
-        <div className="grid w-full max-w-3xl gap-4 text-left sm:grid-cols-3">
-          {RULES.map((rule) => (
-            <div
-              key={rule.title}
-              className="rounded-lg border border-border bg-card p-4"
-            >
-              <h2 className="mb-1 text-sm font-semibold text-foreground">{rule.title}</h2>
-              <p className="text-sm text-muted-foreground">{rule.body}</p>
-            </div>
-          ))}
-        </div>
-        <p className="mt-10 max-w-md text-sm text-muted-foreground">
-          Finished the daily? Practice mode deals unlimited random ladders —
-          same rules, no leaderboard.
-        </p>
       </div>
     </>
   )

@@ -17,6 +17,13 @@
  * the next rung only. The just-changed position shows a lock on the
  * current rung, and a step that changes it is rejected (server-side,
  * with an instant client-side pre-check for feedback).
+ *
+ * SOLVED LOCKS THE DAY: once the daily is solved, the solve (name, steps,
+ * time, path, par) is recorded in localStorage (ladder-solved-v1) and
+ * revisiting shows the Solved state instead of a fresh board — no replay
+ * until tomorrow. The name is locked per date the same way. This is
+ * per-browser enforcement, not per-person: the server still upserts per
+ * (date, name) and cannot bind a browser to a name.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -30,6 +37,13 @@ import {
   preferredPath,
   wanderingPath,
 } from '@/lib/ladder'
+import {
+  loadSolvedBook,
+  recordSolved,
+  saveSolvedBook,
+  solvedFor,
+  type SolvedEntry,
+} from '@/lib/solved'
 
 type Mode = 'daily' | 'practice' | 'bot'
 
@@ -67,6 +81,9 @@ interface BotResult {
   botSeconds: number
   par: number
   gaveUp: boolean
+  // Only what the bot actually walked: if you won, this stops at the bot's
+  // current word — its planned route stays hidden.
+  botPath: string[]
 }
 
 interface Stats {
@@ -92,17 +109,17 @@ const BOT_LEVELS = {
   },
   middle: {
     label: 'Middle',
-    delayMin: 3000,
-    delayMax: 4500,
-    greediness: 0.85,
-    blurb: 'Steady and nearly optimal. A real race.',
+    delayMin: 5000,
+    delayMax: 7000,
+    greediness: 0.7,
+    blurb: 'Takes its time and wanders a little — a thinking human has a real chance.',
   },
   high: {
     label: 'High',
-    delayMin: 1500,
-    delayMax: 2000,
+    delayMin: 3000,
+    delayMax: 4000,
     greediness: 1,
-    blurb: 'Plays the optimal path, fast. Beat it if you can.',
+    blurb: 'Plays the optimal path, but at a human pace. A fast, accurate run can edge it out.',
   },
 } as const
 
@@ -177,6 +194,9 @@ export default function PlayPage() {
     }
   })
   const [savedName, setSavedName] = useState<string | null>(null)
+  // Today's solve, when this browser already solved the daily. Solved locks
+  // the day — the board is not replayable until tomorrow.
+  const [solvedToday, setSolvedToday] = useState<SolvedEntry | null>(null)
   const [saving, setSaving] = useState(false)
   const [board, setBoard] = useState<BoardEntry[] | null>(null)
   const [stats, setStats] = useState<Stats>(loadStats)
@@ -233,13 +253,43 @@ export default function PlayPage() {
     }
   }, [])
 
+  // Enter today's daily: a fresh board, unless this browser already solved
+  // it — then restore the Solved state (no replay; the day is done).
+  function restoreDaily(date: string, start: string) {
+    const solved = solvedFor(loadSolvedBook(), date)
+    setPendingFinish(null)
+    setError(null)
+    setInput('')
+    setHintsUsed(0)
+    setElapsed(0)
+    startAtRef.current = null
+    if (solved) {
+      setSolvedToday(solved)
+      setSavedName(solved.name)
+      setPath(solved.path)
+      setPhase('finished')
+      setResult({
+        steps: solved.steps,
+        par: solved.par,
+        optimalPath: solved.optimalPath,
+        isPar: solved.isPar,
+        gaveUp: false,
+      })
+    } else {
+      setSolvedToday(null)
+      setPath([start])
+      setPhase('playing')
+      setResult(null)
+    }
+  }
+
   const loadDaily = useCallback(async () => {
     setLoadError(null)
     try {
       const res = await fetch('/api/daily')
       const data = (await res.json()) as DailyInfo
       setDaily(data)
-      setPath([data.start])
+      restoreDaily(data.date, data.start)
       void refreshBoard(data.date)
     } catch {
       setLoadError('Could not load today’s ladder. Check your connection and try again.')
@@ -365,6 +415,10 @@ export default function PlayPage() {
       botSeconds,
       par,
       gaveUp,
+      // Only what the bot actually walked: if you won, the shown path stops
+      // at the bot's current word — its planned route stays hidden. When
+      // the bot reaches the target, the walked path is the full path.
+      botPath: botPathRef.current.slice(0, botIndexRef.current + 1),
     })
     setPhase('finished')
   }
@@ -499,6 +553,19 @@ export default function PlayPage() {
       } catch {
         // Non-fatal.
       }
+      // Solved locks the day: record the solve (and the name) locally so
+      // revisiting shows the Solved state instead of a fresh board.
+      const entry: SolvedEntry = {
+        name: playerName,
+        steps: data.steps,
+        seconds,
+        path: [...finalPath],
+        par: data.par,
+        isPar: data.isPar,
+        optimalPath: data.optimalPath,
+      }
+      saveSolvedBook(recordSolved(loadSolvedBook(), daily.date, entry))
+      setSolvedToday(entry)
       setSavedName(playerName)
       setResult({
         steps: data.steps,
@@ -709,7 +776,7 @@ export default function PlayPage() {
     if (next === 'practice') {
       void loadPractice()
     } else if (next === 'daily' && daily) {
-      setPath([daily.start])
+      restoreDaily(daily.date, daily.start)
     }
     focusInput()
   }
@@ -752,6 +819,11 @@ export default function PlayPage() {
         {daily && mode === 'daily' && (
           <span className="text-sm text-muted-foreground">
             #{daily.number} · {daily.date}
+          </span>
+        )}
+        {daily && mode === 'daily' && solvedToday && (
+          <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs font-bold text-emerald-600">
+            ✓ Solved
           </span>
         )}
         <div className="ml-auto flex items-center gap-2">
@@ -1056,9 +1128,9 @@ export default function PlayPage() {
                     <Button onClick={() => void shareResult()} disabled={saving}>
                       {copied ? 'Copied!' : 'Share'}
                     </Button>
-                    <Button variant="outline" onClick={playAgain}>
-                      Play again
-                    </Button>
+                    <span className="text-sm text-muted-foreground">
+                      Solved — come back tomorrow for a new ladder.
+                    </span>
                   </div>
                 )}
                 {mode === 'practice' && (
@@ -1103,10 +1175,12 @@ export default function PlayPage() {
                   </div>
                   <div>
                     <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                      Bot’s path
+                      {botResult.winner === 'bot' && !botResult.gaveUp
+                        ? 'Bot’s path'
+                        : 'Bot’s path so far'}
                     </h3>
                     <ol className="space-y-0.5 font-mono text-sm">
-                      {botPath.map((w, i) => (
+                      {botResult.botPath.map((w, i) => (
                         <li key={i} className="text-foreground">
                           {i}. {w.toUpperCase()}
                         </li>
@@ -1216,16 +1290,24 @@ export default function PlayPage() {
                       <dd className="text-lg font-bold text-foreground">{parRate}%</dd>
                     </div>
                   </dl>
-                  <label className="mt-4 block text-xs font-medium text-muted-foreground">
-                    Display name (for the leaderboard)
-                    <Input
-                      value={name}
-                      onChange={(e) => setName(e.target.value.slice(0, 20))}
-                      placeholder="e.g. Maya"
-                      maxLength={20}
-                      className="mt-1 h-9"
-                    />
-                  </label>
+                  {mode === 'daily' && solvedToday ? (
+                    <p className="mt-4 text-xs text-muted-foreground">
+                      Saved as{' '}
+                      <span className="font-semibold text-foreground">{solvedToday.name}</span>
+                      {' '}— your name is locked in for today.
+                    </p>
+                  ) : (
+                    <label className="mt-4 block text-xs font-medium text-muted-foreground">
+                      Display name (for the leaderboard)
+                      <Input
+                        value={name}
+                        onChange={(e) => setName(e.target.value.slice(0, 20))}
+                        placeholder="e.g. Maya"
+                        maxLength={20}
+                        className="mt-1 h-9"
+                      />
+                    </label>
+                  )}
                 </div>
 
                 <div className="rounded-lg border border-border bg-card p-4">
