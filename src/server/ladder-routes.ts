@@ -19,16 +19,16 @@ import {
   bfs,
   dailyPairFor,
   diffIndex,
-  GUESS_BUCKETS,
   isValidDateStr,
   ladderNumberFor,
   nextStepOnShortestPath,
+  practicePairFor,
   preferredPath,
+  setsForLength,
   utcDateString,
   validatePath,
   validateStep,
 } from '../lib/ladder.js'
-import { DAILY_PAIRS } from '../lib/daily-pairs.js'
 import {
   ensureSeeded,
   readBoard,
@@ -79,7 +79,7 @@ function wordList(value: unknown): string[] {
   return value
     .filter((w): w is string => typeof w === 'string')
     .map((w) => w.toLowerCase())
-    .filter((w) => /^[a-z]{4}$/.test(w))
+    .filter((w) => /^[a-z]{4,5}$/.test(w))
 }
 
 export function registerLadderRoutes(app: Hono<AppContext>): void {
@@ -99,14 +99,15 @@ export function registerLadderRoutes(app: Hono<AppContext>): void {
     const body = await readJson(c)
     const path = wordList(body.path)
     const word = typeof body.word === 'string' ? body.word.toLowerCase() : ''
-    if (path.length === 0 || !/^[a-z]{4}$/.test(word)) {
+    if (path.length === 0 || !/^[a-z]{4,5}$/.test(word)) {
       return c.json({ ok: false, error: 'Not in dictionary' }, 400)
     }
+    const sets = setsForLength(word.length)
     const prev = path[path.length - 1]
     const locked =
       path.length >= 2 ? diffIndex(path[path.length - 2], prev) : -1
     const used = new Set(path)
-    const check = validateStep(prev, word, used, locked)
+    const check = validateStep(prev, word, used, locked, sets.guess)
     if (!check.ok) return c.json({ ok: false, error: check.error })
     return c.json({ ok: true })
   })
@@ -119,16 +120,17 @@ export function registerLadderRoutes(app: Hono<AppContext>): void {
     const body = await readJson(c)
     const current = typeof body.current === 'string' ? body.current.toLowerCase() : ''
     const end = typeof body.end === 'string' ? body.end.toLowerCase() : ''
-    if (!/^[a-z]{4}$/.test(current) || !/^[a-z]{4}$/.test(end)) {
+    if (!/^[a-z]{4,5}$/.test(current) || !/^[a-z]{4,5}$/.test(end)) {
       return c.json({ next: null }, 400)
     }
+    const sets = setsForLength(current.length)
     const path = wordList(body.path)
     const locked =
       path.length >= 2
         ? diffIndex(path[path.length - 2], path[path.length - 1])
         : -1
     return c.json({
-      next: nextStepOnShortestPath(current, end, GUESS_BUCKETS, locked),
+      next: nextStepOnShortestPath(current, end, sets.buckets, locked, sets),
     })
   })
 
@@ -139,16 +141,17 @@ export function registerLadderRoutes(app: Hono<AppContext>): void {
     const start = typeof body.start === 'string' ? body.start.toLowerCase() : ''
     const end = typeof body.end === 'string' ? body.end.toLowerCase() : ''
     const path = wordList(body.path)
-    if (!/^[a-z]{4}$/.test(start) || !/^[a-z]{4}$/.test(end)) {
+    if (!/^[a-z]{4,5}$/.test(start) || !/^[a-z]{4,5}$/.test(end)) {
       return c.json({ valid: false, error: 'Bad pair' }, 400)
     }
-    const check = validatePath(start, end, path)
+    const sets = setsForLength(start.length)
+    const check = validatePath(start, end, path, sets.guess)
     if (!check.ok) {
       return c.json({ valid: false, error: check.error }, 400)
     }
     const steps = check.steps ?? path.length - 1
-    const { dist: par } = bfs(start, end)
-    const optimalPath = preferredPath(start, end) ?? []
+    const { dist: par } = bfs(start, end, sets.buckets)
+    const optimalPath = preferredPath(start, end, sets.buckets, -1, sets) ?? []
     return c.json({
       valid: true,
       steps,
@@ -158,11 +161,12 @@ export function registerLadderRoutes(app: Hono<AppContext>): void {
     })
   })
 
-  // A random pair for practice mode. The par is never included.
+  // A random pair for practice mode (and Bot / 1v1 starts). The par is
+  // never included. ?length=5 serves a 5-letter pair; anything else is 4.
   app.get('/api/practice', (c) => {
-    const idx = Math.floor(Math.random() * DAILY_PAIRS.length)
-    const [start, end] = DAILY_PAIRS[idx]
-    return c.json({ start, end })
+    const length = c.req.query('length') === '5' ? 5 : 4
+    const { start, end } = practicePairFor(length)
+    return c.json({ start, end, length })
   })
 
   // Forfeit: reveal par + optimal path for the current pair without
@@ -173,11 +177,12 @@ export function registerLadderRoutes(app: Hono<AppContext>): void {
     const body = await readJson(c)
     const start = typeof body.start === 'string' ? body.start.toLowerCase() : ''
     const end = typeof body.end === 'string' ? body.end.toLowerCase() : ''
-    if (!/^[a-z]{4}$/.test(start) || !/^[a-z]{4}$/.test(end)) {
+    if (!/^[a-z]{4,5}$/.test(start) || !/^[a-z]{4,5}$/.test(end)) {
       return c.json({ par: -1, optimalPath: [] }, 400)
     }
-    const { dist: par } = bfs(start, end)
-    const optimalPath = preferredPath(start, end) ?? []
+    const sets = setsForLength(start.length)
+    const { dist: par } = bfs(start, end, sets.buckets)
+    const optimalPath = preferredPath(start, end, sets.buckets, -1, sets) ?? []
     return c.json({ par, optimalPath })
   })
 

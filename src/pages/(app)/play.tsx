@@ -32,9 +32,10 @@ import { Lock, Search } from 'lucide-react'
 import { Button, Input } from '@/components/ui'
 import {
   bfs,
+  bucketsForLength,
   diffIndex,
-  GUESS_BUCKETS,
   preferredPath,
+  setsForLength,
   wanderingPath,
 } from '@/lib/ladder'
 import {
@@ -223,6 +224,41 @@ function MiniBar({ fraction, className }: { fraction: number; className: string 
   )
 }
 
+type WordLength = 4 | 5
+
+/** 4 / 5-letter picker for Practice, Bot and 1v1 (Daily stays 4-letter).
+ * `accent` is the mode's bar class (a full Tailwind literal). */
+function LengthPicker({
+  value,
+  onChange,
+  accent,
+}: {
+  value: WordLength
+  onChange: (len: WordLength) => void
+  accent: string
+}) {
+  return (
+    <div className="flex items-center gap-1.5" role="group" aria-label="Word length">
+      <span className="mr-1 text-xs font-medium text-muted-foreground">Word length</span>
+      {([4, 5] as const).map((len) => (
+        <button
+          key={len}
+          type="button"
+          onClick={() => onChange(len)}
+          aria-pressed={value === len}
+          className={
+            value === len
+              ? `rounded-full px-2.5 py-1 text-xs font-bold text-white transition-all hover:scale-[1.04] active:scale-95 ${accent}`
+              : 'rounded-full px-2.5 py-1 text-xs font-medium text-muted-foreground transition-all hover:scale-[1.04] hover:text-foreground active:scale-95'
+          }
+        >
+          {len} letters
+        </button>
+      ))}
+    </div>
+  )
+}
+
 type BotDifficulty = keyof typeof BOT_LEVELS
 
 function loadStats(): Stats {
@@ -313,22 +349,27 @@ interface VersusQueueWireState {
   name: string
   clientId: string
   queuedAt: number
+  length: 4 | 5
 }
 
 function VersusQueueClient({
   clientId,
   name,
   queuedAt,
+  length,
   onMatched,
   onCount,
 }: {
   clientId: string
   name: string
   queuedAt: number
+  length: 4 | 5
   onMatched: (match: VersusMatch) => void
   onCount: (count: number) => void
 }) {
-  const { peers, connected, updateState } = usePresenceRoom('ladder:1v1-queue')
+  // One queue room per word length, so a 4-letter player can never be
+  // matched with a 5-letter one.
+  const { peers, connected, updateState } = usePresenceRoom(`ladder:1v1-queue-${length}`)
   const updateRef = useRef(updateState)
   updateRef.current = updateState
   const matchedRef = useRef(false)
@@ -340,13 +381,13 @@ function VersusQueueClient({
   // Publish our queue entry (re-publish on connect, in case the socket
   // was not up yet on mount).
   useEffect(() => {
-    updateRef.current({ vsQueue: { name, clientId, queuedAt } })
-  }, [connected, name, clientId, queuedAt])
+    updateRef.current({ vsQueue: { name, clientId, queuedAt, length } })
+  }, [connected, name, clientId, queuedAt, length])
 
   useEffect(() => {
     const candidates: QueueCandidate[] = [
-      { clientId, name, queuedAt },
-      ...peers.flatMap((p) => {
+      { clientId, name, queuedAt, length },
+      ...peers.flatMap((p): QueueCandidate[] => {
         const q = (p.state as Record<string, unknown> | undefined)?.vsQueue as
           | VersusQueueWireState
           | undefined
@@ -356,6 +397,9 @@ function VersusQueueClient({
                 clientId: q.clientId,
                 name: String(q.name ?? 'Player'),
                 queuedAt: q.queuedAt,
+                // Peers from an older build carry no length — they are
+                // 4-letter players by definition.
+                length: q.length === 5 ? 5 : 4,
               },
             ]
           : []
@@ -419,6 +463,8 @@ function VersusMatchClient({
 
 export default function PlayPage() {
   const [mode, setMode] = useState<Mode>('daily')
+  // Word length for Practice / Bot / 1v1 (Daily is always 4-letter).
+  const [wordLength, setWordLength] = useState<WordLength>(4)
   const [daily, setDaily] = useState<DailyInfo | null>(null)
   const [practicePair, setPracticePair] = useState<{ start: string; end: string } | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -524,12 +570,14 @@ export default function PlayPage() {
           : versusPair
   const start = pair?.start ?? ''
   const end = pair?.end ?? ''
+  /** Word length of the current pair (4 for the daily, 4 or 5 elsewhere). */
+  const wordLen = pair?.start.length === 5 ? 5 : 4
 
   /** Shortest distance of the current pair — the denominator for the
    * distance-left progress bars in the bot / 1v1 panels. (The number
    * itself is never displayed, so the par stays hidden.) */
   const startDist = useMemo(
-    () => (pair ? bfs(pair.start, pair.end).dist : null),
+    () => (pair ? bfs(pair.start, pair.end, bucketsForLength(pair.start.length)).dist : null),
     [pair],
   )
 
@@ -545,7 +593,9 @@ export default function PlayPage() {
     const side = versusMySideRef.current
     const current = path[path.length - 1] ?? ''
     const locked = path.length >= 2 ? diffIndex(path[path.length - 2], current) : -1
-    const dist = current ? bfs(current, versusMatch.pair.end, GUESS_BUCKETS, 3, locked).dist : 0
+    const dist = current
+      ? bfs(current, versusMatch.pair.end, bucketsForLength(versusMatch.pair.end.length), 3, locked).dist
+      : 0
     return {
       name: versusName,
       clientId: versusClientId,
@@ -616,10 +666,10 @@ export default function PlayPage() {
     }
   }, [refreshBoard])
 
-  const loadPractice = useCallback(async () => {
+  const loadPractice = useCallback(async (length: WordLength = 4) => {
     setLoadError(null)
     try {
-      const res = await fetch('/api/practice')
+      const res = await fetch(`/api/practice?length=${length}`)
       const data = (await res.json()) as { start: string; end: string }
       setPracticePair(data)
       setPath([data.start])
@@ -627,6 +677,21 @@ export default function PlayPage() {
       setLoadError('Could not load a practice ladder. Check your connection and try again.')
     }
   }, [])
+
+  /** Switching practice word length starts a fresh ladder at that length. */
+  function changePracticeLength(len: WordLength) {
+    if (len === wordLength) return
+    setWordLength(len)
+    setPhase('playing')
+    setResult(null)
+    setPendingFinish(null)
+    setError(null)
+    setInput('')
+    setHintsUsed(0)
+    setElapsed(0)
+    startAtRef.current = null
+    void loadPractice(len)
+  }
 
   useEffect(() => {
     void loadDaily()
@@ -706,7 +771,7 @@ export default function PlayPage() {
     setBotIndex(nextIndex)
     const word = path[nextIndex]
     const locked = diffIndex(path[nextIndex - 1], word)
-    const remaining = bfs(word, pair.end, GUESS_BUCKETS, 3, locked).dist
+    const remaining = bfs(word, pair.end, bucketsForLength(pair.end.length), 3, locked).dist
     setBotDistLeft(remaining < 0 ? 0 : remaining)
     if (word === pair.end) {
       finishBotRound('bot', playerPathRef.current)
@@ -725,7 +790,7 @@ export default function PlayPage() {
         ? 0
         : Math.floor((now - botStartedAtRef.current) / 1000)
     const pair = botPairRef.current
-    const par = pair ? bfs(pair.start, pair.end).dist : 0
+    const par = pair ? bfs(pair.start, pair.end, bucketsForLength(pair.start.length)).dist : 0
     if (winner === 'you') playerFinishedRef.current = true
     else botFinishedRef.current = true
     setBotResult({
@@ -760,14 +825,16 @@ export default function PlayPage() {
     playerFinishedRef.current = false
     botFinishedRef.current = false
     try {
-      const res = await fetch('/api/practice')
+      const res = await fetch(`/api/practice?length=${wordLength}`)
       const data = (await res.json()) as { start: string; end: string }
       const cfg = BOT_LEVELS[difficulty]
-      const optimal = preferredPath(data.start, data.end)
+      const buckets = bucketsForLength(wordLength)
+      const sets = setsForLength(wordLength)
+      const optimal = preferredPath(data.start, data.end, buckets, -1, sets)
       const line =
         difficulty === 'high'
           ? optimal
-          : (wanderingPath(data.start, data.end, { greediness: cfg.greediness }) ??
+          : (wanderingPath(data.start, data.end, { greediness: cfg.greediness }, buckets, sets) ??
             optimal)
       if (!line || line.length < 2) {
         setLoadError('Could not build a bot ladder. Try again.')
@@ -783,7 +850,7 @@ export default function PlayPage() {
       setBotPair(data)
       setBotPath(line)
       setBotIndex(0)
-      setBotDistLeft(bfs(data.start, data.end).dist)
+      setBotDistLeft(bfs(data.start, data.end, buckets).dist)
       setPath([data.start])
       setBotLoading(false)
       scheduleBotStep(randomBotDelay(cfg))
@@ -1328,7 +1395,7 @@ export default function PlayPage() {
       return
     }
     if (mode === 'practice') {
-      void loadPractice()
+      void loadPractice(wordLength)
     } else if (daily) {
       setPath([daily.start])
     }
@@ -1350,7 +1417,7 @@ export default function PlayPage() {
     setElapsed(0)
     startAtRef.current = null
     if (next === 'practice') {
-      void loadPractice()
+      void loadPractice(wordLength)
     } else if (next === 'daily' && daily) {
       restoreDaily(daily.date, daily.start)
     } else if (next === 'versus') {
@@ -1392,11 +1459,6 @@ export default function PlayPage() {
     <div className="mx-auto w-full max-w-3xl px-4 py-8">
       <div className="mb-6 flex flex-wrap items-center gap-3">
         <h1 className="text-3xl font-bold tracking-tight text-foreground">Ladder</h1>
-        {daily && mode === 'daily' && (
-          <span className="text-sm text-muted-foreground">
-            #{daily.number} · {daily.date}
-          </span>
-        )}
         {daily && mode === 'daily' && solvedToday && (
           <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs font-bold text-emerald-600">
             ✓ Solved
@@ -1431,6 +1493,12 @@ export default function PlayPage() {
         {MODE_STYLE[mode].flavor}
       </p>
 
+      {mode === 'practice' && (
+        <div className="-mt-3 mb-6">
+          <LengthPicker value={wordLength} onChange={changePracticeLength} accent={MODE_STYLE.practice.bar} />
+        </div>
+      )}
+
       {solvingNow !== null && (
         <p className="mb-4 text-sm text-muted-foreground">
           <span className="mr-1.5 inline-block h-2 w-2 rounded-full bg-emerald-500 align-middle" />
@@ -1441,7 +1509,7 @@ export default function PlayPage() {
       {loadError && (
         <div className="mb-4 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-foreground">
           {loadError}
-          <Button variant="outline" size="sm" className="ml-3" onClick={() => (mode === 'daily' ? void loadDaily() : mode === 'practice' ? void loadPractice() : botDifficultyRef.current ? void startBotRound(botDifficultyRef.current) : showBotPicker())}>
+          <Button variant="outline" size="sm" className="ml-3" onClick={() => (mode === 'daily' ? void loadDaily() : mode === 'practice' ? void loadPractice(wordLength) : botDifficultyRef.current ? void startBotRound(botDifficultyRef.current) : showBotPicker())}>
             Retry
           </Button>
         </div>
@@ -1455,6 +1523,9 @@ export default function PlayPage() {
             Same start word, same target — first one there wins. Each race is a new random
             ladder. Pick a difficulty:
           </p>
+          <div className="mt-3">
+            <LengthPicker value={wordLength} onChange={setWordLength} accent={MODE_STYLE.bot.bar} />
+          </div>
           <div className="mt-4 grid gap-3 sm:grid-cols-3">
             {(['elementary', 'middle', 'high'] as const).map((level) => (
               <button
@@ -1493,6 +1564,9 @@ export default function PlayPage() {
           <p className="mt-1 text-sm text-muted-foreground">
             Enter a name, join the queue, and race the first person who shows up.
           </p>
+          <div className="mt-3">
+            <LengthPicker value={wordLength} onChange={setWordLength} accent={MODE_STYLE.versus.bar} />
+          </div>
           <div className="mt-3 flex gap-2">
             <Input
               value={versusName}
@@ -1551,6 +1625,7 @@ export default function PlayPage() {
             clientId={versusClientId}
             name={versusName}
             queuedAt={versusQueuedAtRef.current}
+            length={wordLength}
             onMatched={handleVersusMatched}
             onCount={setVersusQueueCount}
           />
@@ -1650,7 +1725,7 @@ export default function PlayPage() {
                     ref={inputRef}
                     autoFocus
                     value={input}
-                    onChange={(e) => setInput(e.target.value.replace(/[^a-zA-Z]/g, '').slice(0, 4))}
+                    onChange={(e) => setInput(e.target.value.replace(/[^a-zA-Z]/g, '').slice(0, wordLen))}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') {
                         e.preventDefault()
@@ -2057,7 +2132,9 @@ export default function PlayPage() {
                       <span className="font-semibold text-foreground">{solvedToday.name}</span>
                       {' '}— your name is locked in for today.
                     </p>
-                  ) : (
+                  ) : mode === 'daily' ? (
+                    // Practice has no name field: practice scores never reach
+                    // the leaderboard, so there is nothing to name.
                     <label className="mt-4 block text-xs font-medium text-muted-foreground">
                       Display name (for the leaderboard)
                       <Input
@@ -2068,7 +2145,7 @@ export default function PlayPage() {
                         className="mt-1 h-9"
                       />
                     </label>
-                  )}
+                  ) : null}
                 </div>
 
                 <div className="rounded-lg border border-border bg-card p-4">

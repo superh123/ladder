@@ -20,7 +20,11 @@
 import { WORDS_COMMON } from './words-common.js'
 import { WORDS_GUESS } from './words-guess.js'
 import { WORDS_LEGIT } from './words-legit.js'
+import { WORDS_COMMON_5 } from './words-common-5.js'
+import { WORDS_GUESS_5 } from './words-guess-5.js'
+import { WORDS_LEGIT_5 } from './words-legit-5.js'
 import { DAILY_PAIRS } from './daily-pairs.js'
+import { PRACTICE_PAIRS_5 } from './practice-pairs-5.js'
 
 export const EPOCH_UTC = '2026-11-22'
 
@@ -114,17 +118,74 @@ const GUESS_SET = new Set<string>(WORDS_GUESS)
 const COMMON_SET = new Set<string>(WORDS_COMMON)
 const LEGIT_SET = new Set<string>(WORDS_LEGIT)
 
-export function isGuessWord(word: string): boolean {
-  return GUESS_SET.has(word)
+export const GUESS_BUCKETS_5 = buildBuckets(WORDS_GUESS_5)
+const GUESS_SET_5 = new Set<string>(WORDS_GUESS_5)
+const COMMON_SET_5 = new Set<string>(WORDS_COMMON_5)
+const LEGIT_SET_5 = new Set<string>(WORDS_LEGIT_5)
+
+/**
+ * Everything the engine needs for one word length: the word sets and
+ * the wildcard buckets built from the guess list. Daily is 4-letter;
+ * Bot / Practice / 1v1 can also play 5-letter.
+ */
+export interface WordSets {
+  length: number
+  common: ReadonlySet<string>
+  guess: ReadonlySet<string>
+  legit: ReadonlySet<string>
+  buckets: Buckets
 }
 
-export function isCommonWord(word: string): boolean {
-  return COMMON_SET.has(word)
+export const SETS_4: WordSets = {
+  length: 4,
+  common: COMMON_SET,
+  guess: GUESS_SET,
+  legit: LEGIT_SET,
+  buckets: GUESS_BUCKETS,
+}
+
+export const SETS_5: WordSets = {
+  length: 5,
+  common: COMMON_SET_5,
+  guess: GUESS_SET_5,
+  legit: LEGIT_SET_5,
+  buckets: GUESS_BUCKETS_5,
+}
+
+/** The word sets for a length (anything other than 5 is 4-letter). */
+export function setsForLength(len: number): WordSets {
+  return len === 5 ? SETS_5 : SETS_4
+}
+
+export function bucketsForLength(len: number): Buckets {
+  return setsForLength(len).buckets
+}
+
+function setsForBuckets(buckets: Buckets): WordSets {
+  return buckets === GUESS_BUCKETS_5 ? SETS_5 : SETS_4
+}
+
+export function isGuessWord(word: string, sets: WordSets = SETS_4): boolean {
+  return sets.guess.has(word)
+}
+
+export function isCommonWord(word: string, sets: WordSets = SETS_4): boolean {
+  return sets.common.has(word)
 }
 
 /** True when `word` is presentable in a hint or an optimal-path reveal. */
-export function isPresentableWord(word: string): boolean {
-  return LEGIT_SET.has(word)
+export function isPresentableWord(word: string, sets: WordSets = SETS_4): boolean {
+  return sets.legit.has(word)
+}
+
+/** A random pair for Practice / Bot / 1v1 at the given word length. */
+export function practicePairFor(
+  length: 4 | 5,
+  random: () => number = Math.random,
+): { start: string; end: string } {
+  const bank = length === 5 ? PRACTICE_PAIRS_5 : DAILY_PAIRS
+  const [start, end] = bank[Math.floor(random() * bank.length)]
+  return { start, end }
 }
 
 /** Index of the single differing letter, or -1 when the words differ by != 1 letter. */
@@ -238,7 +299,7 @@ export function bfs(
   // shortest paths are the sum of the per-state counts at the par.
   let pathCount = 0
   let bestKey: string | null = null
-  for (let last = 0; last < 4; last++) {
+  for (let last = 0; last < end.length; last++) {
     const k = stateKey(end, last)
     if (dist.get(k) === endDist) {
       pathCount = Math.min(cap, pathCount + (count.get(k) ?? 0))
@@ -262,8 +323,9 @@ export function nextStepOnShortestPath(
   end: string,
   buckets: Buckets = GUESS_BUCKETS,
   initialLocked = -1,
+  sets: WordSets = setsForBuckets(buckets),
 ): string | null {
-  const path = preferredPath(current, end, buckets, initialLocked)
+  const path = preferredPath(current, end, buckets, initialLocked, sets)
   return path === null || path.length < 2 ? null : path[1]
 }
 
@@ -284,11 +346,11 @@ function distancesToEnd(
 ): Map<string, number> {
   const dist = new Map<string, number>()
   const queue: Array<{ word: string; last: number }> = []
-  // Seed the four "arrived at target" states. There is no (target, -1)
+  // Seed the "arrived at target" states. There is no (target, -1)
   // state: no move ever leaves lastChanged at -1, so it has no
   // predecessors and must not be expanded (expanding it would credit
   // every neighbour with a 1-step distance regardless of the lock).
-  for (let last = 0; last < 4; last++) {
+  for (let last = 0; last < target.length; last++) {
     const k = stateKey(target, last)
     dist.set(k, 0)
     queue.push({ word: target, last })
@@ -302,7 +364,7 @@ function distancesToEnd(
     for (const u of neighbors(v, buckets)) {
       if (diffIndex(u, v) !== p) continue
       if (allowed !== undefined && u !== alwaysAllow && !allowed.has(u)) continue
-      for (let q = -1; q < 4; q++) {
+      for (let q = -1; q < target.length; q++) {
         if (q === p) continue
         const uKey = stateKey(u, q)
         if (dist.has(uKey)) continue
@@ -329,6 +391,7 @@ export function preferredPath(
   end: string,
   buckets: Buckets = GUESS_BUCKETS,
   initialLocked = -1,
+  sets: WordSets = setsForBuckets(buckets),
 ): string[] | null {
   if (start === end) return [start]
   // The full reverse map already holds the par: the distance from the
@@ -338,11 +401,11 @@ export function preferredPath(
   if (par === undefined) return null
   // Try the presentable subgraph first: a clean shortest path exists
   // exactly when its distance equals the par.
-  const clean = distancesToEnd(end, buckets, LEGIT_SET, start)
+  const clean = distancesToEnd(end, buckets, sets.legit, start)
   if (clean.get(stateKey(start, initialLocked)) === par) {
-    return walkPath(start, end, clean, buckets, initialLocked)
+    return walkPath(start, end, clean, buckets, initialLocked, sets)
   }
-  return walkPath(start, end, full, buckets, initialLocked)
+  return walkPath(start, end, full, buckets, initialLocked, sets)
 }
 
 /** Walk from `start` to `end`, always stepping to a state one closer. */
@@ -352,6 +415,7 @@ function walkPath(
   dist: Map<string, number>,
   buckets: Buckets,
   initialLocked = -1,
+  sets: WordSets = SETS_4,
 ): string[] | null {
   const path = [start]
   let cur = start
@@ -363,7 +427,7 @@ function walkPath(
       (m) => dist.get(stateKey(m.word, m.pos)) === curDist - 1,
     )
     if (options.length === 0) return null
-    const next = pickPreferred(options.map((m) => m.word))
+    const next = pickPreferred(options.map((m) => m.word), sets)
     if (next === null) return null
     const pos = diffIndex(cur, next)
     if (pos === -1) return null
@@ -375,11 +439,11 @@ function walkPath(
 }
 
 /** Prefer a common word, then a presentable word, then the first candidate. */
-function pickPreferred(options: string[]): string | null {
+function pickPreferred(options: string[], sets: WordSets = SETS_4): string | null {
   if (options.length === 0) return null
   return (
-    options.find((w) => isCommonWord(w)) ??
-    options.find((w) => isPresentableWord(w)) ??
+    options.find((w) => isCommonWord(w, sets)) ??
+    options.find((w) => isPresentableWord(w, sets)) ??
     options[0]
   )
 }
@@ -415,6 +479,7 @@ export function wanderingPath(
   end: string,
   options: WanderOptions = {},
   buckets: Buckets = GUESS_BUCKETS,
+  sets: WordSets = setsForBuckets(buckets),
 ): string[] | null {
   const {
     greediness = 0.5,
@@ -457,7 +522,7 @@ export function wanderingPath(
     }
     if (!stuck && cur === end) return path
   }
-  return preferredPath(start, end, buckets)
+  return preferredPath(start, end, buckets, -1, sets)
 }
 
 // ---------------------------------------------------------------------------
@@ -475,9 +540,10 @@ export function validateStep(
   word: string,
   used: ReadonlySet<string>,
   lockedPos = -1,
+  guessSet: ReadonlySet<string> = GUESS_SET,
 ): { ok: true } | { ok: false; error: StepError } {
   const w = word.toLowerCase()
-  if (!isGuessWord(w)) return { ok: false, error: 'Not in dictionary' }
+  if (!guessSet.has(w)) return { ok: false, error: 'Not in dictionary' }
   const changed = diffIndex(prev, w)
   if (changed === -1) return { ok: false, error: 'Change 1 letter' }
   if (changed === lockedPos) {
@@ -499,6 +565,7 @@ export function validatePath(
   start: string,
   end: string,
   path: string[],
+  guessSet: ReadonlySet<string> = GUESS_SET,
 ): PathValidation {
   if (!Array.isArray(path) || path.length < 2) {
     return { ok: false, error: 'Path too short' }
@@ -512,7 +579,7 @@ export function validatePath(
   for (let i = 1; i < lower.length; i++) {
     // The position changed on the previous step is locked for this one.
     const locked = i >= 2 ? diffIndex(lower[i - 2], lower[i - 1]) : -1
-    const check = validateStep(lower[i - 1], lower[i], used, locked)
+    const check = validateStep(lower[i - 1], lower[i], used, locked, guessSet)
     if (!check.ok) return { ok: false, error: `${check.error} at step ${i + 1}` }
     used.add(lower[i])
   }

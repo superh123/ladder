@@ -63,7 +63,7 @@ export default function Landing() {
             Ladder
           </p>
           <h1
-            className="animate-tile-in mb-4 max-w-2xl text-4xl font-bold tracking-tight text-foreground sm:text-6xl"
+            className="animate-tile-in mx-auto mb-4 max-w-2xl text-balance text-center text-4xl font-bold tracking-tight text-foreground sm:text-6xl"
             style={{ animationDelay: '90ms' }}
           >
             One ladder a day.{' '}

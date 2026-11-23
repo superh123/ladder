@@ -20,17 +20,22 @@
  */
 
 import { DAILY_PAIRS } from './daily-pairs'
+import { PRACTICE_PAIRS_5 } from './practice-pairs-5'
 
 export interface QueueCandidate {
   clientId: string
   name: string
   queuedAt: number
+  /** Word length the player chose — a queue only ever matches one length. */
+  length: 4 | 5
 }
 
 export interface VersusMatch {
   matchId: string
   players: [QueueCandidate, QueueCandidate]
   pair: { start: string; end: string }
+  /** Word length both players are racing at. */
+  length: 4 | 5
   /** Shared epoch (ms) — finish times are measured as ms since this. */
   epoch: number
 }
@@ -73,29 +78,48 @@ function hashString(s: string): number {
 }
 
 /** The pair for a match, derived from the match id — both sides agree. */
-export function pairForMatch(matchId: string): { start: string; end: string } {
-  const [start, end] = DAILY_PAIRS[hashString(matchId) % DAILY_PAIRS.length]
+export function pairForMatch(
+  matchId: string,
+  length: 4 | 5 = 4,
+): { start: string; end: string } {
+  const bank = length === 5 ? PRACTICE_PAIRS_5 : DAILY_PAIRS
+  const [start, end] = bank[hashString(matchId) % bank.length]
   return { start, end }
 }
 
 /**
- * Match the two longest-waiting queuers. Deterministic: every client that
- * sees the same candidate set computes the same match. Returns null with
- * fewer than two candidates.
+ * Match the two longest-waiting queuers of the same word length.
+ * Deterministic: every client that sees the same candidate set computes
+ * the same match. Length groups are tried longest-waiting first, so a
+ * lone 4-letter waiter never blocks two 5-letter waiters from matching
+ * each other. Returns null when no length has two queuers.
  */
 export function deriveMatch(candidates: QueueCandidate[]): VersusMatch | null {
   if (candidates.length < 2) return null
   const sorted = [...candidates].sort(
     (a, b) => a.queuedAt - b.queuedAt || (a.clientId < b.clientId ? -1 : 1),
   )
-  const [a, b] = sorted
-  const matchId = `vs-${a.clientId.slice(0, 8)}-${b.clientId.slice(0, 8)}-${a.queuedAt}`
-  return {
-    matchId,
-    players: [a, b],
-    pair: pairForMatch(matchId),
-    epoch: Math.min(a.queuedAt, b.queuedAt),
+  const byLength = new Map<4 | 5, QueueCandidate[]>()
+  for (const c of sorted) {
+    const group = byLength.get(c.length) ?? []
+    group.push(c)
+    byLength.set(c.length, group)
   }
+  const groups = [...byLength.values()].sort((a, b) => a[0].queuedAt - b[0].queuedAt)
+  for (const group of groups) {
+    if (group.length < 2) continue
+    const [a, b] = group
+    const length = a.length
+    const matchId = `vs-${a.clientId.slice(0, 8)}-${b.clientId.slice(0, 8)}-${a.queuedAt}`
+    return {
+      matchId,
+      players: [a, b],
+      pair: pairForMatch(matchId, length),
+      length,
+      epoch: Math.min(a.queuedAt, b.queuedAt),
+    }
+  }
+  return null
 }
 
 function isFinished(s: VersusSideState): boolean {

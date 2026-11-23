@@ -14,6 +14,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   bfs,
+  bucketsForLength,
   dailyPairFor,
   diffIndex,
   GUESS_BUCKETS,
@@ -22,12 +23,15 @@ import {
   ladderNumberFor,
   mulberry32,
   nextStepOnShortestPath,
+  practicePairFor,
   preferredPath,
+  setsForLength,
   validatePath,
   validateStep,
   wanderingPath,
 } from './ladder'
 import { DAILY_PAIRS } from './daily-pairs'
+import { PRACTICE_PAIRS_5 } from './practice-pairs-5'
 
 describe('bfs', () => {
   it('cold -> warm is par 4 via wold, word, ward', () => {
@@ -300,5 +304,92 @@ describe('preferredPath', () => {
     const path = preferredPath(start, end)
     expect(path).not.toBeNull()
     for (const word of path!) expect(isPresentableWord(word)).toBe(true)
+  })
+})
+
+describe('5-letter mode', () => {
+  const sets5 = setsForLength(5)
+  const buckets5 = bucketsForLength(5)
+  const [bankStart, bankEnd] = PRACTICE_PAIRS_5[0]
+
+  it('solves a banked 5-letter pair at par 4-7 with >= 2 shortest paths', () => {
+    const { path, dist, pathCount } = bfs(bankStart, bankEnd, buckets5)
+    expect(dist).toBeGreaterThanOrEqual(4)
+    expect(dist).toBeLessThanOrEqual(7)
+    expect(pathCount).toBeGreaterThanOrEqual(2)
+    expect(path).not.toBeNull()
+    expect(validatePath(bankStart, bankEnd, path!, sets5.guess)).toEqual({
+      ok: true,
+      steps: dist,
+    })
+  })
+
+  it('validates 5-letter steps against the 5-letter guess list', () => {
+    const { path } = bfs(bankStart, bankEnd, buckets5)
+    expect(path).not.toBeNull()
+    // Every rung of a real solution validates, lock included.
+    const used = new Set<string>([path![0]])
+    for (let i = 1; i < path!.length; i++) {
+      const locked = i >= 2 ? diffIndex(path![i - 2], path![i - 1]) : -1
+      expect(validateStep(path![i - 1], path![i], used, locked, sets5.guess)).toEqual({
+        ok: true,
+      })
+      used.add(path![i])
+    }
+    // A 4-letter word is not a 5-letter dictionary word.
+    expect(validateStep(bankStart, 'cold', new Set([bankStart]), -1, sets5.guess)).toEqual({
+      ok: false,
+      error: 'Not in dictionary',
+    })
+  })
+
+  it('rejects a full 5-letter path that breaks the lock rule', () => {
+    const { path } = bfs(bankStart, bankEnd, buckets5)
+    expect(path).not.toBeNull()
+    // Repeat the first step's changed position on the second rung.
+    const broken = [...path!]
+    const pos = diffIndex(broken[0], broken[1])
+    const alphabet = 'abcdefghijklmnopqrstuvwxyz'
+    for (const ch of alphabet) {
+      const alt = broken[1].slice(0, pos) + ch + broken[1].slice(pos + 1)
+      if (alt !== broken[1] && sets5.guess.has(alt) && diffIndex(broken[1], alt) === pos) {
+        broken[2] = alt
+        break
+      }
+    }
+    if (broken[2] !== path![2]) {
+      expect(validatePath(bankStart, bankEnd, broken, sets5.guess).ok).toBe(false)
+    }
+  })
+
+  it('shows a presentable-only optimal path for a banked pair', () => {
+    const { dist } = bfs(bankStart, bankEnd, buckets5)
+    const shown = preferredPath(bankStart, bankEnd, buckets5, -1, sets5)
+    expect(shown).not.toBeNull()
+    expect(shown!.length - 1).toBe(dist)
+    for (const word of shown!) expect(isPresentableWord(word, sets5)).toBe(true)
+  })
+
+  it('hints on a 5-letter ladder and wanders legally', () => {
+    const next = nextStepOnShortestPath(bankStart, bankEnd, buckets5, -1, sets5)
+    expect(next).not.toBeNull()
+    expect(diffIndex(bankStart, next!)).not.toBe(-1)
+    const wandered = wanderingPath(bankStart, bankEnd, {
+      greediness: 0.5,
+      random: mulberry32(42),
+    }, buckets5, sets5)
+    expect(wandered).not.toBeNull()
+    expect(validatePath(bankStart, bankEnd, wandered!, sets5.guess).ok).toBe(true)
+  })
+
+  it('practicePairFor picks the right bank per length', () => {
+    const five = practicePairFor(5, mulberry32(7))
+    expect(five.start).toHaveLength(5)
+    expect(five.end).toHaveLength(5)
+    expect(PRACTICE_PAIRS_5).toContainEqual([five.start, five.end])
+    const four = practicePairFor(4, mulberry32(7))
+    expect(four.start).toHaveLength(4)
+    expect(four.end).toHaveLength(4)
+    expect(DAILY_PAIRS).toContainEqual([four.start, four.end])
   })
 })

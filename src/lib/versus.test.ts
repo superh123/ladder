@@ -7,13 +7,15 @@ import {
   type VersusSideState,
 } from './versus'
 import { DAILY_PAIRS } from './daily-pairs'
+import { PRACTICE_PAIRS_5 } from './practice-pairs-5'
 
 function candidate(
   clientId: string,
   queuedAt: number,
   name = 'Player',
+  length: 4 | 5 = 4,
 ): QueueCandidate {
-  return { clientId, name, queuedAt }
+  return { clientId, name, queuedAt, length }
 }
 
 const playing: VersusSideState = { status: 'playing' }
@@ -32,6 +34,15 @@ describe('pairForMatch', () => {
     expect(DAILY_PAIRS).toContainEqual([a.start, a.end])
     expect(pairForMatch('vs-other-id-999')).not.toEqual(a)
   })
+
+  it('serves 5-letter pairs from the 5-letter bank', () => {
+    const a = pairForMatch('vs-abc-def-123', 5)
+    const b = pairForMatch('vs-abc-def-123', 5)
+    expect(a).toEqual(b)
+    expect(a.start).toHaveLength(5)
+    expect(a.end).toHaveLength(5)
+    expect(PRACTICE_PAIRS_5).toContainEqual([a.start, a.end])
+  })
 })
 
 describe('deriveMatch', () => {
@@ -48,6 +59,25 @@ describe('deriveMatch', () => {
     ])
     expect(m).not.toBeNull()
     expect(m!.players.map((p) => p.clientId)).toEqual(['a', 'b'])
+    expect(m!.length).toBe(4)
+  })
+
+  it('never matches across word lengths', () => {
+    expect(
+      deriveMatch([candidate('a', 100, 'A', 4), candidate('b', 200, 'B', 5)]),
+    ).toBeNull()
+  })
+
+  it('matches the two 5-letter queuers even with a lone 4-letter waiter ahead', () => {
+    const m = deriveMatch([
+      candidate('a', 100, 'A', 4),
+      candidate('b', 200, 'B', 5),
+      candidate('c', 300, 'C', 5),
+    ])
+    expect(m).not.toBeNull()
+    expect(m!.length).toBe(5)
+    expect(m!.players.map((p) => p.clientId)).toEqual(['b', 'c'])
+    expect(m!.pair.start).toHaveLength(5)
   })
 
   it('breaks queuedAt ties by clientId and is deterministic', () => {
