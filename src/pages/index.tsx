@@ -24,7 +24,7 @@ export default function Landing() {
       <Seo {...seo} path="/" />
       <div
         data-testid="static-landing"
-        className="flex min-h-screen flex-col items-center px-6 py-16 text-center"
+        className="flex min-h-screen flex-col items-center justify-center px-6 py-16 text-center"
       >
         <p className="mb-3 text-sm uppercase tracking-widest text-muted-foreground">
           Ladder
@@ -50,7 +50,7 @@ export default function Landing() {
         </div>
         <Link
           to="/play"
-          className="mb-12 inline-flex items-center gap-2 rounded-full bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90"
+          className="inline-flex items-center gap-2 rounded-full bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90"
         >
           Play today’s ladder
         </Link>

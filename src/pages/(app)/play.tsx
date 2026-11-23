@@ -26,7 +26,7 @@
  * (date, name) and cannot bind a browser to a name.
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { usePresenceRoom } from 'deepspace'
 import { Lock } from 'lucide-react'
 import { Button, Input } from '@/components/ui'
@@ -38,6 +38,16 @@ import {
   wanderingPath,
 } from '@/lib/ladder'
 import {
+  deriveMatch,
+  DISCONNECT_GRACE_MS,
+  OPPONENT_JOIN_TIMEOUT_MS,
+  resolveVersus,
+  SETTLE_MS,
+  type QueueCandidate,
+  type VersusMatch,
+  type VersusSideState,
+} from '@/lib/versus'
+import {
   loadSolvedBook,
   recordSolved,
   saveSolvedBook,
@@ -45,7 +55,34 @@ import {
   type SolvedEntry,
 } from '@/lib/solved'
 
-type Mode = 'daily' | 'practice' | 'bot'
+type Mode = 'daily' | 'practice' | 'bot' | 'versus'
+
+/** What one side of a 1v1 match broadcasts (steps + distance only — never
+ * the current word, and the path only after the match is resolved). */
+interface VersusPeerWireState {
+  name: string
+  clientId: string
+  status: 'playing' | 'finished' | 'gave-up' | 'done'
+  steps: number
+  /** Shortest distance left, or null when the end is unreachable from here. */
+  distance: number | null
+  finishMs?: number
+  finishSteps?: number
+  gaveUpMs?: number
+  /** Only present once the match is resolved (the side-by-side reveal). */
+  path?: string[]
+}
+
+interface VersusResult {
+  winner: 'you' | 'opponent'
+  reason: 'finish' | 'forfeit' | 'disconnect'
+  mySteps: number
+  mySeconds: number
+  oppSteps: number | null
+  oppSeconds: number | null
+  oppName: string
+  oppPath: string[] | null
+}
 
 interface DailyInfo {
   date: string
@@ -173,6 +210,150 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
   return (await res.json()) as T
 }
 
+/**
+ * Brisk staggered reveal — the first row shows at once, the rest appear
+ * one every ~300ms, so the player registers the line without sitting
+ * through a slow animation. Used for the bot's path and the 1v1
+ * opponent's path in the end-of-round panels.
+ */
+function RevealList({ words }: { words: string[] }) {
+  const key = words.join(',')
+  const [shown, setShown] = useState(1)
+  useEffect(() => {
+    setShown(1)
+  }, [key])
+  useEffect(() => {
+    if (shown >= words.length) return
+    const id = window.setTimeout(
+      () => setShown((n) => Math.min(n + 1, words.length)),
+      300,
+    )
+    return () => window.clearTimeout(id)
+  }, [shown, words.length])
+  return (
+    <ol className="space-y-0.5 font-mono text-sm">
+      {words.slice(0, shown).map((w, i) => (
+        <li key={i} className="text-foreground">
+          {i}. {w.toUpperCase()}
+        </li>
+      ))}
+    </ol>
+  )
+}
+
+// --- 1v1 presence clients -------------------------------------------------
+// These are separate components so their usePresenceRoom hooks only connect
+// while the stage needs them: mounting the queue client joins the queue,
+// unmounting it leaves. The match client likewise.
+
+interface VersusQueueWireState {
+  name: string
+  clientId: string
+  queuedAt: number
+}
+
+function VersusQueueClient({
+  clientId,
+  name,
+  queuedAt,
+  onMatched,
+  onCount,
+}: {
+  clientId: string
+  name: string
+  queuedAt: number
+  onMatched: (match: VersusMatch) => void
+  onCount: (count: number) => void
+}) {
+  const { peers, connected, updateState } = usePresenceRoom('ladder:1v1-queue')
+  const updateRef = useRef(updateState)
+  updateRef.current = updateState
+  const matchedRef = useRef(false)
+  const onMatchedRef = useRef(onMatched)
+  onMatchedRef.current = onMatched
+  const onCountRef = useRef(onCount)
+  onCountRef.current = onCount
+
+  // Publish our queue entry (re-publish on connect, in case the socket
+  // was not up yet on mount).
+  useEffect(() => {
+    updateRef.current({ vsQueue: { name, clientId, queuedAt } })
+  }, [connected, name, clientId, queuedAt])
+
+  useEffect(() => {
+    const candidates: QueueCandidate[] = [
+      { clientId, name, queuedAt },
+      ...peers.flatMap((p) => {
+        const q = (p.state as Record<string, unknown> | undefined)?.vsQueue as
+          | VersusQueueWireState
+          | undefined
+        return q && typeof q.clientId === 'string' && typeof q.queuedAt === 'number'
+          ? [
+              {
+                clientId: q.clientId,
+                name: String(q.name ?? 'Player'),
+                queuedAt: q.queuedAt,
+              },
+            ]
+          : []
+      }),
+    ]
+    onCountRef.current(candidates.length)
+    if (matchedRef.current) return
+    const match = deriveMatch(candidates)
+    if (
+      match &&
+      (match.players[0].clientId === clientId || match.players[1].clientId === clientId)
+    ) {
+      matchedRef.current = true
+      onMatchedRef.current(match)
+    }
+  }, [peers, clientId, name, queuedAt])
+
+  return null
+}
+
+function VersusMatchClient({
+  match,
+  oppClientId,
+  myState,
+  onOpponent,
+}: {
+  match: VersusMatch
+  oppClientId: string
+  myState: VersusPeerWireState
+  onOpponent: (s: VersusPeerWireState | null) => void
+}) {
+  const { peers, connected, updateState } = usePresenceRoom(`ladder:1v1:${match.matchId}`)
+  const updateRef = useRef(updateState)
+  updateRef.current = updateState
+  const onOpponentRef = useRef(onOpponent)
+  onOpponentRef.current = onOpponent
+
+  // Publish our side's state whenever it changes (steps, distance,
+  // status — never the current word; the path only after resolution).
+  const myKey = JSON.stringify(myState)
+  useEffect(() => {
+    updateRef.current({ vsMatch: JSON.parse(myKey) as VersusPeerWireState })
+  }, [myKey, connected])
+
+  // The opponent is the peer whose match state carries their client id.
+  const oppWire = peers
+    .map(
+      (p) =>
+        (p.state as Record<string, unknown> | undefined)?.vsMatch as
+          | VersusPeerWireState
+          | undefined,
+    )
+    .find((s) => s?.clientId === oppClientId)
+  const oppKey = oppWire ? JSON.stringify(oppWire) : ''
+  useEffect(() => {
+    onOpponentRef.current(oppKey ? (JSON.parse(oppKey) as VersusPeerWireState) : null)
+  }, [oppKey])
+
+  return null
+}
+
 export default function PlayPage() {
   const [mode, setMode] = useState<Mode>('daily')
   const [daily, setDaily] = useState<DailyInfo | null>(null)
@@ -230,7 +411,54 @@ export default function PlayPage() {
     playerPathRef.current = path
   }, [path])
 
-  const pair = mode === 'daily' ? daily : mode === 'practice' ? practicePair : botPair
+  // --- 1v1 mode ------------------------------------------------------------
+  // Queue + match run on presence rooms (see VersusQueueClient /
+  // VersusMatchClient above). My side's state lives in a ref so timer
+  // callbacks always see the latest values; bumping versusSideVersion
+  // re-renders so the match client re-publishes it.
+  const [versusClientId] = useState(
+    () =>
+      (typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : `vs-${Math.random().toString(36).slice(2)}-${Date.now()}`) as string,
+  )
+  const [versusName, setVersusName] = useState(() => {
+    try {
+      return localStorage.getItem(NAME_KEY) ?? ''
+    } catch {
+      return ''
+    }
+  })
+  const [versusStage, setVersusStage] = useState<'entry' | 'queued' | 'match' | 'done'>(
+    'entry',
+  )
+  const [versusQueueSession, setVersusQueueSession] = useState(0)
+  const [versusQueueCount, setVersusQueueCount] = useState(1)
+  const [versusQueueError, setVersusQueueError] = useState<string | null>(null)
+  const [versusPair, setVersusPair] = useState<{ start: string; end: string } | null>(null)
+  const [versusMatch, setVersusMatch] = useState<VersusMatch | null>(null)
+  const [versusOpp, setVersusOpp] = useState<VersusPeerWireState | null>(null)
+  const [versusOppInMatch, setVersusOppInMatch] = useState(false)
+  const [versusResult, setVersusResult] = useState<VersusResult | null>(null)
+  const [versusSideVersion, setVersusSideVersion] = useState(0)
+  const versusQueuedAtRef = useRef(0)
+  const versusMatchRef = useRef<VersusMatch | null>(null)
+  const versusOppRef = useRef<VersusPeerWireState | null>(null)
+  const versusMySideRef = useRef<VersusSideState>({ status: 'playing' })
+  const versusResolvedRef = useRef(false)
+  const versusSettleTimerRef = useRef<number | null>(null)
+  const versusDcTimerRef = useRef<number | null>(null)
+  const versusJoinTimerRef = useRef<number | null>(null)
+  const versusOppSeenRef = useRef(false)
+
+  const pair =
+    mode === 'daily'
+      ? daily
+      : mode === 'practice'
+        ? practicePair
+        : mode === 'bot'
+          ? botPair
+          : versusPair
   const start = pair?.start ?? ''
   const end = pair?.end ?? ''
 
@@ -238,6 +466,27 @@ export default function PlayPage() {
   const prevWord = path.length > 0 ? path[path.length - 1] : ''
   const lockedPos =
     path.length >= 2 ? diffIndex(path[path.length - 2], prevWord) : -1
+
+  // My 1v1 broadcast: steps + distance only. The path rides along only
+  // once the match is resolved (side.reveal), for the side-by-side reveal.
+  const versusMyWire: VersusPeerWireState | null = useMemo(() => {
+    if (!versusMatch || mode !== 'versus') return null
+    const side = versusMySideRef.current
+    const current = path[path.length - 1] ?? ''
+    const locked = path.length >= 2 ? diffIndex(path[path.length - 2], current) : -1
+    const dist = current ? bfs(current, versusMatch.pair.end, GUESS_BUCKETS, 3, locked).dist : 0
+    return {
+      name: versusName,
+      clientId: versusClientId,
+      status: side.status,
+      steps: Math.max(0, path.length - 1),
+      distance: dist < 0 ? null : dist,
+      finishMs: side.finishMs,
+      finishSteps: side.finishSteps,
+      gaveUpMs: side.gaveUpMs,
+      path: side.reveal ? [...path] : undefined,
+    }
+  }, [versusMatch, mode, path, versusName, versusClientId, versusSideVersion])
 
   // Presence: who else is on today's puzzle right now.
   const { peers, connected } = usePresenceRoom(daily ? `ladder:${daily.date}` : 'ladder:loading')
@@ -328,6 +577,7 @@ export default function PlayPage() {
         clearTimeout(botTimerRef.current)
         botTimerRef.current = null
       }
+      clearVersusTimers()
     }
   }, [])
 
@@ -484,6 +734,241 @@ export default function PlayPage() {
     focusInput()
   }
 
+  // --- 1v1 mode ------------------------------------------------------------
+  function clearVersusTimers() {
+    for (const ref of [versusSettleTimerRef, versusDcTimerRef, versusJoinTimerRef]) {
+      if (ref.current !== null) {
+        clearTimeout(ref.current)
+        ref.current = null
+      }
+    }
+  }
+
+  function updateMySide(patch: Partial<VersusSideState>) {
+    versusMySideRef.current = { ...versusMySideRef.current, ...patch }
+    setVersusSideVersion((v) => v + 1)
+  }
+
+  function resetVersus() {
+    clearVersusTimers()
+    versusMatchRef.current = null
+    versusOppRef.current = null
+    versusMySideRef.current = { status: 'playing' }
+    versusResolvedRef.current = false
+    versusOppSeenRef.current = false
+    setVersusMatch(null)
+    setVersusPair(null)
+    setVersusOpp(null)
+    setVersusOppInMatch(false)
+    setVersusResult(null)
+    setVersusQueueError(null)
+    setVersusQueueCount(1)
+    setVersusSideVersion((v) => v + 1)
+  }
+
+  function joinVersusQueue() {
+    const trimmed = versusName.trim()
+    if (!trimmed) {
+      setVersusQueueError('Enter a name first.')
+      return
+    }
+    if (trimmed.length > 20) {
+      setVersusQueueError('Keep it to 20 characters.')
+      return
+    }
+    try {
+      localStorage.setItem(NAME_KEY, trimmed)
+    } catch {
+      // Non-fatal.
+    }
+    setVersusName(trimmed)
+    versusQueuedAtRef.current = Date.now()
+    setVersusQueueSession((s) => s + 1)
+    setVersusQueueError(null)
+    setVersusStage('queued')
+  }
+
+  function leaveVersusQueue() {
+    resetVersus()
+    setVersusStage('entry')
+  }
+
+  function handleVersusMatched(match: VersusMatch) {
+    if (versusMatchRef.current) return
+    versusMatchRef.current = match
+    setVersusMatch(match)
+    setVersusPair(match.pair)
+    setPath([match.pair.start])
+    setPhase('playing')
+    setResult(null)
+    setPendingFinish(null)
+    setError(null)
+    setInput('')
+    setElapsed(0)
+    startAtRef.current = null
+    setVersusStage('match')
+    // If the opponent never shows up in the match room, stop waiting and
+    // re-queue with a fresh timestamp (back of the line), so we cannot
+    // deadlock on a player who left mid-handshake.
+    versusJoinTimerRef.current = window.setTimeout(() => {
+      versusJoinTimerRef.current = null
+      if (!versusOppSeenRef.current && !versusResolvedRef.current) {
+        resetVersus()
+        versusQueuedAtRef.current = Date.now()
+        setVersusQueueSession((s) => s + 1)
+        setVersusStage('queued')
+      }
+    }, OPPONENT_JOIN_TIMEOUT_MS)
+    focusInput()
+  }
+
+  function finishVersusMatch(outcome: {
+    winner: 'me' | 'opponent'
+    reason: 'finish' | 'forfeit' | 'disconnect'
+  }) {
+    if (versusResolvedRef.current) return
+    versusResolvedRef.current = true
+    clearVersusTimers()
+    const match = versusMatchRef.current
+    const mySeconds =
+      startAtRef.current === null ? 0 : Math.floor((Date.now() - startAtRef.current) / 1000)
+    const opp = versusOppRef.current
+    // Publish the full path now that the match is resolved — the reveal.
+    updateMySide({ reveal: true })
+    setVersusResult({
+      winner: outcome.winner === 'me' ? 'you' : 'opponent',
+      reason: outcome.reason,
+      mySteps: playerPathRef.current.length - 1,
+      mySeconds,
+      oppSteps: opp?.finishSteps ?? (opp ? opp.steps : null),
+      oppSeconds:
+        opp?.finishMs != null && match ? Math.floor(opp.finishMs / 1000) : null,
+      oppName: match
+        ? (match.players.find((p) => p.clientId !== versusClientId)?.name ?? 'Opponent')
+        : 'Opponent',
+      oppPath: opp?.path ?? null,
+    })
+    setPhase('finished')
+    setVersusStage('done')
+  }
+
+  function maybeSettleVersus() {
+    if (versusResolvedRef.current || !versusMatchRef.current) return
+    const me = versusMySideRef.current
+    const opp = versusOppRef.current
+    const oppSide: VersusSideState | null = opp
+      ? {
+          status: opp.status,
+          finishMs: opp.finishMs,
+          finishSteps: opp.finishSteps,
+          gaveUpMs: opp.gaveUpMs,
+        }
+      : null
+    const outcome = resolveVersus(me, oppSide, { settleDone: false, oppGone: false })
+    if (outcome.status === 'decided') {
+      finishVersusMatch(outcome)
+      return
+    }
+    // Someone finished — give the other side's finish a moment to arrive
+    // before deciding, so a near-simultaneous finish still tie-breaks.
+    const someoneFinished =
+      me.status === 'finished' ||
+      me.status === 'done' ||
+      (oppSide !== null && (oppSide.status === 'finished' || oppSide.status === 'done'))
+    if (someoneFinished && versusSettleTimerRef.current === null) {
+      versusSettleTimerRef.current = window.setTimeout(() => {
+        versusSettleTimerRef.current = null
+        if (versusResolvedRef.current) return
+        const m = versusMySideRef.current
+        const o = versusOppRef.current
+        const oSide: VersusSideState | null = o
+          ? {
+              status: o.status,
+              finishMs: o.finishMs,
+              finishSteps: o.finishSteps,
+              gaveUpMs: o.gaveUpMs,
+            }
+          : null
+        const out = resolveVersus(m, oSide, { settleDone: true, oppGone: false })
+        if (out.status === 'decided') finishVersusMatch(out)
+      }, SETTLE_MS)
+    }
+  }
+
+  function handleVersusOpponent(opp: VersusPeerWireState | null) {
+    const wasSeen = versusOppSeenRef.current
+    versusOppRef.current = opp
+    setVersusOpp(opp)
+    if (opp) {
+      versusOppSeenRef.current = true
+      setVersusOppInMatch(true)
+      if (versusDcTimerRef.current !== null) {
+        clearTimeout(versusDcTimerRef.current)
+        versusDcTimerRef.current = null
+      }
+      // The opponent's path may arrive after we already resolved — stash
+      // it into the result so the reveal fills in (and survives them
+      // leaving right after).
+      if (versusResolvedRef.current && opp.path) {
+        setVersusResult((prev) =>
+          prev && !prev.oppPath ? { ...prev, oppPath: opp.path! } : prev,
+        )
+      }
+      maybeSettleVersus()
+    } else if (wasSeen && !versusResolvedRef.current) {
+      // Opponent vanished mid-match: give them a grace period to
+      // reconnect before calling it a win by disconnect.
+      if (versusDcTimerRef.current === null) {
+        versusDcTimerRef.current = window.setTimeout(() => {
+          versusDcTimerRef.current = null
+          if (versusResolvedRef.current) return
+          const out = resolveVersus(versusMySideRef.current, null, {
+            settleDone: true,
+            oppGone: true,
+          })
+          if (out.status === 'decided') finishVersusMatch(out)
+        }, DISCONNECT_GRACE_MS)
+      }
+    }
+  }
+
+  function finishVersusRound(finalPath: string[]) {
+    const match = versusMatchRef.current
+    if (!match || versusResolvedRef.current) return
+    updateMySide({
+      status: 'finished',
+      finishMs: Date.now() - match.epoch,
+      finishSteps: finalPath.length - 1,
+    })
+    setPhase('finished')
+    maybeSettleVersus()
+  }
+
+  function queueVersusAgain() {
+    resetVersus()
+    setPhase('playing')
+    setResult(null)
+    setPendingFinish(null)
+    setError(null)
+    setInput('')
+    versusQueuedAtRef.current = Date.now()
+    setVersusQueueSession((s) => s + 1)
+    setVersusStage('queued')
+    focusInput()
+  }
+
+  function versusChangeName() {
+    resetVersus()
+    setPhase('playing')
+    setResult(null)
+    setPendingFinish(null)
+    setError(null)
+    setInput('')
+    setPath([])
+    setVersusStage('entry')
+    focusInput()
+  }
+
   function recordDailyFinish(isPar: boolean, date: string) {
     setStats((prev) => {
       if (prev.lastPlayedDate === date) {
@@ -589,6 +1074,11 @@ export default function PlayPage() {
     // Bot mode: reaching the end first wins the race — no server scoring.
     if (mode === 'bot') {
       if (!botFinishedRef.current) finishBotRound('you', finalPath)
+      return
+    }
+    // 1v1: reaching the end first wins the race — no server scoring.
+    if (mode === 'versus') {
+      finishVersusRound(finalPath)
       return
     }
     const seconds = startAtRef.current === null ? 0 : Math.floor((Date.now() - startAtRef.current) / 1000)
@@ -719,6 +1209,16 @@ export default function PlayPage() {
       finishBotRound('bot', path, true)
       return
     }
+    // 1v1: giving up forfeits the race to the opponent.
+    if (mode === 'versus') {
+      if (!versusMatchRef.current || versusResolvedRef.current) return
+      updateMySide({
+        status: 'gave-up',
+        gaveUpMs: Date.now() - versusMatchRef.current.epoch,
+      })
+      maybeSettleVersus()
+      return
+    }
     try {
       const data = await postJson<{ par: number; optimalPath: string[] }>('/api/giveup', {
         start: pair.start,
@@ -739,6 +1239,10 @@ export default function PlayPage() {
   }
 
   function playAgain() {
+    if (mode === 'versus') {
+      queueVersusAgain()
+      return
+    }
     setResult(null)
     setPendingFinish(null)
     setError(null)
@@ -764,6 +1268,7 @@ export default function PlayPage() {
     if (next === mode) return
     clearBotTimer()
     resetBotRound()
+    if (mode === 'versus') resetVersus()
     setMode(next)
     setPhase('playing')
     setResult(null)
@@ -777,6 +1282,9 @@ export default function PlayPage() {
       void loadPractice()
     } else if (next === 'daily' && daily) {
       restoreDaily(daily.date, daily.start)
+    } else if (next === 'versus') {
+      setVersusStage('entry')
+      setPath([])
     }
     focusInput()
   }
@@ -808,9 +1316,6 @@ export default function PlayPage() {
   const parRate =
     stats.played > 0 ? Math.round((stats.parHits / stats.played) * 100) : 0
   const solvingNow = mode === 'daily' && connected ? peers.length + 1 : null
-  const botWord = botPath.length > 0 ? botPath[Math.min(botIndex, botPath.length - 1)] : ''
-  const botPrevWord = botIndex > 0 && botPath.length > 0 ? botPath[botIndex - 1] : ''
-  const botChanged = botPrevWord ? diffIndex(botPrevWord, botWord) : -1
 
   return (
     <div className="mx-auto w-full max-w-3xl px-4 py-8">
@@ -868,6 +1373,18 @@ export default function PlayPage() {
             >
               Bot
             </button>
+            <button
+              role="tab"
+              aria-selected={mode === 'versus'}
+              onClick={() => switchMode('versus')}
+              className={
+                mode === 'versus'
+                  ? 'rounded-full bg-primary px-3 py-1 font-medium text-primary-foreground'
+                  : 'rounded-full px-3 py-1 text-muted-foreground hover:text-foreground'
+              }
+            >
+              1v1
+            </button>
           </div>
         </div>
       </div>
@@ -923,9 +1440,81 @@ export default function PlayPage() {
         <p className="text-muted-foreground">Loading your race…</p>
       )}
 
-      {!pair && !loadError && mode !== 'bot' && (
+      {!pair && !loadError && mode !== 'bot' && mode !== 'versus' && (
         <p className="text-muted-foreground">Loading today’s ladder…</p>
       )}
+
+      {/* 1v1: name entry + queue */}
+      {mode === 'versus' && versusStage === 'entry' && (
+        <div className="rounded-lg border border-border bg-card p-5">
+          <h2 className="text-lg font-semibold text-foreground">Race a live opponent</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Enter a name, join the queue, and race the first person who shows up. Same
+            ladder, first to the target wins — if you both finish, the shorter path wins.
+            No sign-in.
+          </p>
+          <div className="mt-3 flex gap-2">
+            <Input
+              value={versusName}
+              onChange={(e) => setVersusName(e.target.value.slice(0, 20))}
+              placeholder="Your name"
+              aria-label="Your name for 1v1"
+              maxLength={20}
+              className="h-10 flex-1"
+            />
+            <Button onClick={joinVersusQueue}>Join queue</Button>
+          </div>
+          {versusQueueError && (
+            <p className="mt-2 text-sm font-medium text-destructive">{versusQueueError}</p>
+          )}
+        </div>
+      )}
+
+      {mode === 'versus' && versusStage === 'queued' && (
+        <div className="rounded-lg border border-border bg-card p-5">
+          <h2 className="text-lg font-semibold text-foreground">
+            In the queue as {versusName}
+          </h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Waiting for an opponent…{' '}
+            {versusQueueCount > 1
+              ? `${versusQueueCount} in the queue right now.`
+              : 'You’re first in line.'}
+          </p>
+          <div className="mt-4">
+            <Button variant="outline" onClick={leaveVersusQueue}>
+              Leave queue
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* 1v1 presence: queue + match rooms (these render nothing). */}
+      {mode === 'versus' &&
+        (versusStage === 'queued' ||
+          (versusStage === 'match' && !versusOppInMatch)) && (
+          <VersusQueueClient
+            key={versusQueueSession}
+            clientId={versusClientId}
+            name={versusName}
+            queuedAt={versusQueuedAtRef.current}
+            onMatched={handleVersusMatched}
+            onCount={setVersusQueueCount}
+          />
+        )}
+      {mode === 'versus' &&
+        versusMatch &&
+        (versusStage === 'match' || versusStage === 'done') &&
+        versusMyWire && (
+          <VersusMatchClient
+            match={versusMatch}
+            oppClientId={
+              versusMatch.players.find((p) => p.clientId !== versusClientId)?.clientId ?? ''
+            }
+            myState={versusMyWire}
+            onOpponent={handleVersusOpponent}
+          />
+        )}
 
       {pair && !botLoading && (
         <div className="grid gap-6 md:grid-cols-[1fr_240px]">
@@ -1179,19 +1768,84 @@ export default function PlayPage() {
                         ? 'Bot’s path'
                         : 'Bot’s path so far'}
                     </h3>
-                    <ol className="space-y-0.5 font-mono text-sm">
-                      {botResult.botPath.map((w, i) => (
-                        <li key={i} className="text-foreground">
-                          {i}. {w.toUpperCase()}
-                        </li>
-                      ))}
-                    </ol>
+                    <RevealList words={botResult.botPath} />
                   </div>
                 </div>
                 <div className="mt-4 flex flex-wrap gap-2">
                   <Button onClick={playAgain}>Race again</Button>
                   <Button variant="outline" onClick={showBotPicker}>
                     Change difficulty
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {phase === 'finished' && mode === 'versus' && !versusResult && (
+              <div className="mt-6 rounded-lg border border-border bg-card p-5">
+                <h2 className="text-lg font-semibold text-foreground">Finished!</h2>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Checking the result…
+                </p>
+              </div>
+            )}
+
+            {phase === 'finished' && mode === 'versus' && versusResult && (
+              <div className="mt-6 rounded-lg border border-border bg-card p-5">
+                <h2 className="text-lg font-semibold text-foreground">
+                  {versusResult.winner === 'you'
+                    ? 'You won the race! 🎉'
+                    : versusResult.reason === 'forfeit'
+                      ? 'You gave up — your opponent wins'
+                      : versusResult.reason === 'disconnect'
+                        ? 'Your opponent left — you win'
+                        : `${versusResult.oppName} beat you`}
+                </h2>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  You: {versusResult.mySteps} steps · {formatTime(versusResult.mySeconds)}
+                  {' · '}
+                  {versusResult.oppName}:{' '}
+                  {versusResult.oppSteps === null
+                    ? '—'
+                    : `${versusResult.oppSteps} steps${
+                        versusResult.oppSeconds !== null
+                          ? ` · ${formatTime(versusResult.oppSeconds)}`
+                          : ''
+                      }`}
+                </p>
+                <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                  <div>
+                    <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      Your path
+                    </h3>
+                    <ol className="space-y-0.5 font-mono text-sm">
+                      {path.map((w, i) => (
+                        <li key={i} className={i === 0 ? 'text-muted-foreground' : 'text-foreground'}>
+                          {i}. {w.toUpperCase()}
+                        </li>
+                      ))}
+                    </ol>
+                  </div>
+                  <div>
+                    <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      Opponent’s path
+                    </h3>
+                    {versusResult.oppPath ? (
+                      <RevealList words={versusResult.oppPath} />
+                    ) : versusOpp?.path ? (
+                      <RevealList words={versusOpp.path} />
+                    ) : (
+                      <p className="text-sm text-muted-foreground">
+                        {versusResult.reason === 'disconnect'
+                          ? 'Your opponent left before the reveal.'
+                          : 'Waiting for your opponent’s path…'}
+                      </p>
+                    )}
+                  </div>
+                </div>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <Button onClick={playAgain}>Queue again</Button>
+                  <Button variant="outline" onClick={versusChangeName}>
+                    Change name
                   </Button>
                 </div>
               </div>
@@ -1229,41 +1883,65 @@ export default function PlayPage() {
                 <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                   Bot · {botDifficulty ? BOT_LEVELS[botDifficulty].label : ''}
                 </h2>
-                {botWord && (
-                  <>
-                    <div className="flex gap-1">
-                      {botWord.split('').map((ch, j) => (
-                        <span
-                          key={j}
-                          className={`flex h-9 w-9 items-center justify-center rounded-md border text-base font-bold uppercase ${
-                            j === botChanged
-                              ? 'border-primary bg-primary text-primary-foreground'
-                              : 'border-border bg-muted/50 text-foreground'
-                          }`}
-                        >
-                          {ch}
-                        </span>
-                      ))}
-                    </div>
-                    <dl className="mt-3 space-y-1.5 text-sm">
-                      <div className="flex justify-between">
-                        <dt className="text-muted-foreground">Bot steps</dt>
-                        <dd className="font-bold text-foreground">{botIndex}</dd>
-                      </div>
-                      <div className="flex justify-between">
-                        <dt className="text-muted-foreground">Distance left</dt>
-                        <dd className="font-bold text-foreground">
-                          {botDistLeft === null ? '—' : `${botDistLeft} to go`}
-                        </dd>
-                      </div>
-                    </dl>
-                    {phase === 'playing' && (
-                      <p className="mt-3 flex items-center gap-1.5 text-xs text-muted-foreground">
-                        <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-emerald-500" />
-                        Bot is thinking…
-                      </p>
-                    )}
-                  </>
+                {/* Steps + distance only — the bot's current word stays
+                    hidden while racing, or the player could copy its moves. */}
+                <dl className="space-y-1.5 text-sm">
+                  <div className="flex justify-between">
+                    <dt className="text-muted-foreground">Bot steps</dt>
+                    <dd className="font-bold text-foreground">{botIndex}</dd>
+                  </div>
+                  <div className="flex justify-between">
+                    <dt className="text-muted-foreground">Distance left</dt>
+                    <dd className="font-bold text-foreground">
+                      {botDistLeft === null ? '—' : `${botDistLeft} to go`}
+                    </dd>
+                  </div>
+                </dl>
+                {phase === 'playing' && (
+                  <p className="mt-3 flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-emerald-500" />
+                    Bot is thinking…
+                  </p>
+                )}
+              </div>
+            ) : mode === 'versus' ? (
+              <div className="rounded-lg border border-border bg-card p-4">
+                <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Opponent · {versusOpp ? versusOpp.name : 'waiting…'}
+                </h2>
+                {versusStage === 'match' || versusStage === 'done' ? (
+                  versusOpp ? (
+                    <>
+                      <dl className="space-y-1.5 text-sm">
+                        <div className="flex justify-between">
+                          <dt className="text-muted-foreground">Steps</dt>
+                          <dd className="font-bold text-foreground">{versusOpp.steps}</dd>
+                        </div>
+                        <div className="flex justify-between">
+                          <dt className="text-muted-foreground">Distance left</dt>
+                          <dd className="font-bold text-foreground">
+                            {versusOpp.distance === null
+                              ? '—'
+                              : `${versusOpp.distance} to go`}
+                          </dd>
+                        </div>
+                      </dl>
+                      {phase === 'playing' && (
+                        <p className="mt-3 flex items-center gap-1.5 text-xs text-muted-foreground">
+                          <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-emerald-500" />
+                          Opponent is playing…
+                        </p>
+                      )}
+                    </>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">
+                      Waiting for your opponent to join…
+                    </p>
+                  )
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    Join the queue to race a live opponent.
+                  </p>
                 )}
               </div>
             ) : (
