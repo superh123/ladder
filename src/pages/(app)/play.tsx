@@ -6,15 +6,32 @@
  * daily freely. Personal stats live in localStorage; scores reach the
  * worker's public routes, which validate everything server-side.
  *
- * The client never imports the engine (src/lib/ladder.ts): the guess
- * graph and the BFS solver stay server-side, and the par is only ever
+ * Bot mode imports the engine (src/lib/ladder.ts) into the browser: the
+ * bot's path is simulated client-side from the same solver the server
+ * uses. Bot mode has no leaderboard, so there is nothing to cheat for —
+ * but it does mean the solver ships in the client bundle. The daily
+ * game still validates every step server-side, and the par is only ever
  * revealed after a finish or a forfeit.
+ *
+ * THE LOCK RULE: the letter position changed in one rung is locked for
+ * the next rung only. The just-changed position shows a lock on the
+ * current rung, and a step that changes it is rejected (server-side,
+ * with an instant client-side pre-check for feedback).
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { usePresenceRoom } from 'deepspace'
+import { Lock } from 'lucide-react'
 import { Button, Input } from '@/components/ui'
-import { Modal } from '@/components/ui/Modal'
+import {
+  bfs,
+  diffIndex,
+  GUESS_BUCKETS,
+  preferredPath,
+  wanderingPath,
+} from '@/lib/ladder'
+
+type Mode = 'daily' | 'practice' | 'bot'
 
 interface DailyInfo {
   date: string
@@ -42,6 +59,16 @@ interface FinishResult {
   needsName?: boolean
 }
 
+interface BotResult {
+  winner: 'you' | 'bot'
+  playerSteps: number
+  playerSeconds: number
+  botSteps: number
+  botSeconds: number
+  par: number
+  gaveUp: boolean
+}
+
 interface Stats {
   lastPlayedDate: string | null
   streak: number
@@ -53,6 +80,33 @@ interface Stats {
 
 const STATS_KEY = 'ladder-stats-v1'
 const NAME_KEY = 'ladder-name'
+
+/** Bot difficulties: how fast the bot moves, and how optimal its line is. */
+const BOT_LEVELS = {
+  elementary: {
+    label: 'Elementary',
+    delayMin: 6000,
+    delayMax: 9000,
+    greediness: 0.45,
+    blurb: 'Slow and wandering — takes the scenic route. A gentle first race.',
+  },
+  middle: {
+    label: 'Middle',
+    delayMin: 3000,
+    delayMax: 4500,
+    greediness: 0.85,
+    blurb: 'Steady and nearly optimal. A real race.',
+  },
+  high: {
+    label: 'High',
+    delayMin: 1500,
+    delayMax: 2000,
+    greediness: 1,
+    blurb: 'Plays the optimal path, fast. Beat it if you can.',
+  },
+} as const
+
+type BotDifficulty = keyof typeof BOT_LEVELS
 
 function loadStats(): Stats {
   try {
@@ -93,18 +147,6 @@ function formatTime(totalSeconds: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`
 }
 
-/** Index of the single differing letter between two 4-letter words. */
-function diffIndex(a: string, b: string): number {
-  let diff = -1
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) {
-      if (diff !== -1) return -1
-      diff = i
-    }
-  }
-  return diff
-}
-
 async function postJson<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
     method: 'POST',
@@ -115,7 +157,7 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
 }
 
 export default function PlayPage() {
-  const [mode, setMode] = useState<'daily' | 'practice'>('daily')
+  const [mode, setMode] = useState<Mode>('daily')
   const [daily, setDaily] = useState<DailyInfo | null>(null)
   const [practicePair, setPracticePair] = useState<{ start: string; end: string } | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -139,14 +181,43 @@ export default function PlayPage() {
   const [board, setBoard] = useState<BoardEntry[] | null>(null)
   const [stats, setStats] = useState<Stats>(loadStats)
   const [elapsed, setElapsed] = useState(0)
-  const [showHood, setShowHood] = useState(false)
   const [copied, setCopied] = useState(false)
   const startAtRef = useRef<number | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
-  const pair = mode === 'daily' ? daily : practicePair
+  // --- Bot mode -------------------------------------------------------------
+  const [botDifficulty, setBotDifficulty] = useState<BotDifficulty | null>(null)
+  const [botPair, setBotPair] = useState<{ start: string; end: string } | null>(null)
+  const [botPath, setBotPath] = useState<string[]>([])
+  const [botIndex, setBotIndex] = useState(0)
+  const [botDistLeft, setBotDistLeft] = useState<number | null>(null)
+  const [botResult, setBotResult] = useState<BotResult | null>(null)
+  const [botLoading, setBotLoading] = useState(false)
+  // Refs are the race's source of truth: timeout callbacks must see the
+  // latest values, not the render scope they were scheduled from.
+  const botTimerRef = useRef<number | null>(null)
+  const botPathRef = useRef<string[]>([])
+  const botIndexRef = useRef(0)
+  const botPairRef = useRef<{ start: string; end: string } | null>(null)
+  const botDifficultyRef = useRef<BotDifficulty | null>(null)
+  const botStartedAtRef = useRef<number | null>(null)
+  const botFinishedRef = useRef(false)
+  const playerFinishedRef = useRef(false)
+  // The player's current path, mirrored for timeout callbacks (the bot
+  // wins from inside a timer, where the render scope's `path` is stale).
+  const playerPathRef = useRef<string[]>([])
+  useEffect(() => {
+    playerPathRef.current = path
+  }, [path])
+
+  const pair = mode === 'daily' ? daily : mode === 'practice' ? practicePair : botPair
   const start = pair?.start ?? ''
   const end = pair?.end ?? ''
+
+  // The position locked for the next rung: the one changed on the last step.
+  const prevWord = path.length > 0 ? path[path.length - 1] : ''
+  const lockedPos =
+    path.length >= 2 ? diffIndex(path[path.length - 2], prevWord) : -1
 
   // Presence: who else is on today's puzzle right now.
   const { peers, connected } = usePresenceRoom(daily ? `ladder:${daily.date}` : 'ladder:loading')
@@ -200,7 +271,164 @@ export default function PlayPage() {
     return () => clearInterval(id)
   }, [phase])
 
+  // Never leave a bot timer running after unmount.
+  useEffect(() => {
+    return () => {
+      if (botTimerRef.current !== null) {
+        clearTimeout(botTimerRef.current)
+        botTimerRef.current = null
+      }
+    }
+  }, [])
+
   const focusInput = () => inputRef.current?.focus()
+
+  function clearBotTimer() {
+    if (botTimerRef.current !== null) {
+      clearTimeout(botTimerRef.current)
+      botTimerRef.current = null
+    }
+  }
+
+  function resetBotRound() {
+    clearBotTimer()
+    botPathRef.current = []
+    botIndexRef.current = 0
+    botPairRef.current = null
+    botDifficultyRef.current = null
+    botStartedAtRef.current = null
+    botFinishedRef.current = false
+    playerFinishedRef.current = false
+    setBotPair(null)
+    setBotPath([])
+    setBotIndex(0)
+    setBotDistLeft(null)
+    setBotResult(null)
+    setBotDifficulty(null)
+    setBotLoading(false)
+  }
+
+  function randomBotDelay(cfg: (typeof BOT_LEVELS)[BotDifficulty]): number {
+    return cfg.delayMin + Math.random() * (cfg.delayMax - cfg.delayMin)
+  }
+
+  function scheduleBotStep(delayMs: number) {
+    clearBotTimer()
+    botTimerRef.current = window.setTimeout(() => {
+      botTimerRef.current = null
+      advanceBot()
+    }, delayMs)
+  }
+
+  function advanceBot() {
+    const pair = botPairRef.current
+    const path = botPathRef.current
+    const difficulty = botDifficultyRef.current
+    if (!pair || !difficulty || path.length < 2) return
+    if (botFinishedRef.current || playerFinishedRef.current) return
+    const nextIndex = botIndexRef.current + 1
+    if (nextIndex >= path.length) {
+      finishBotRound('bot', playerPathRef.current)
+      return
+    }
+    botIndexRef.current = nextIndex
+    setBotIndex(nextIndex)
+    const word = path[nextIndex]
+    const locked = diffIndex(path[nextIndex - 1], word)
+    const remaining = bfs(word, pair.end, GUESS_BUCKETS, 3, locked).dist
+    setBotDistLeft(remaining < 0 ? 0 : remaining)
+    if (word === pair.end) {
+      finishBotRound('bot', playerPathRef.current)
+      return
+    }
+    scheduleBotStep(randomBotDelay(BOT_LEVELS[difficulty]))
+  }
+
+  function finishBotRound(winner: 'you' | 'bot', playerPath: string[], gaveUp = false) {
+    clearBotTimer()
+    const now = Date.now()
+    const playerSeconds =
+      startAtRef.current === null ? 0 : Math.floor((now - startAtRef.current) / 1000)
+    const botSeconds =
+      botStartedAtRef.current === null
+        ? 0
+        : Math.floor((now - botStartedAtRef.current) / 1000)
+    const pair = botPairRef.current
+    const par = pair ? bfs(pair.start, pair.end).dist : 0
+    if (winner === 'you') playerFinishedRef.current = true
+    else botFinishedRef.current = true
+    setBotResult({
+      winner,
+      playerSteps: playerPath.length - 1,
+      playerSeconds,
+      botSteps: botIndexRef.current,
+      botSeconds,
+      par,
+      gaveUp,
+    })
+    setPhase('finished')
+  }
+
+  async function startBotRound(difficulty: BotDifficulty) {
+    clearBotTimer()
+    setLoadError(null)
+    setBotLoading(true)
+    setBotResult(null)
+    setResult(null)
+    setPendingFinish(null)
+    setError(null)
+    setInput('')
+    setHintsUsed(0)
+    setElapsed(0)
+    startAtRef.current = null
+    setPhase('playing')
+    playerFinishedRef.current = false
+    botFinishedRef.current = false
+    try {
+      const res = await fetch('/api/practice')
+      const data = (await res.json()) as { start: string; end: string }
+      const cfg = BOT_LEVELS[difficulty]
+      const optimal = preferredPath(data.start, data.end)
+      const line =
+        difficulty === 'high'
+          ? optimal
+          : (wanderingPath(data.start, data.end, { greediness: cfg.greediness }) ??
+            optimal)
+      if (!line || line.length < 2) {
+        setLoadError('Could not build a bot ladder. Try again.')
+        setBotLoading(false)
+        return
+      }
+      botPathRef.current = line
+      botIndexRef.current = 0
+      botPairRef.current = data
+      botDifficultyRef.current = difficulty
+      botStartedAtRef.current = Date.now()
+      setBotDifficulty(difficulty)
+      setBotPair(data)
+      setBotPath(line)
+      setBotIndex(0)
+      setBotDistLeft(bfs(data.start, data.end).dist)
+      setPath([data.start])
+      setBotLoading(false)
+      scheduleBotStep(randomBotDelay(cfg))
+      focusInput()
+    } catch {
+      setBotLoading(false)
+      setLoadError('Could not load a bot ladder. Check your connection and try again.')
+    }
+  }
+
+  function showBotPicker() {
+    clearBotTimer()
+    resetBotRound()
+    setPhase('playing')
+    setResult(null)
+    setPendingFinish(null)
+    setError(null)
+    setInput('')
+    focusInput()
+  }
 
   function recordDailyFinish(isPar: boolean, date: string) {
     setStats((prev) => {
@@ -291,6 +519,11 @@ export default function PlayPage() {
 
   async function finishPath(finalPath: string[]) {
     if (!pair) return
+    // Bot mode: reaching the end first wins the race — no server scoring.
+    if (mode === 'bot') {
+      if (!botFinishedRef.current) finishBotRound('you', finalPath)
+      return
+    }
     const seconds = startAtRef.current === null ? 0 : Math.floor((Date.now() - startAtRef.current) / 1000)
     setPhase('finished')
     if (mode === 'practice') {
@@ -348,6 +581,12 @@ export default function PlayPage() {
     if (!pair || phase !== 'playing') return
     const word = input.trim().toLowerCase()
     if (!word) return
+    // Instant lock feedback client-side (the server re-checks on /api/validate).
+    if (lockedPos !== -1 && diffIndex(prevWord, word) === lockedPos) {
+      setError("That letter's locked for this rung")
+      setShakeNonce((n) => n + 1)
+      return
+    }
     if (startAtRef.current === null) startAtRef.current = Date.now()
     try {
       const data = await postJson<{ ok: boolean; error?: string }>('/api/validate', {
@@ -376,7 +615,7 @@ export default function PlayPage() {
   }
 
   async function requestHint() {
-    if (!pair || phase !== 'playing' || hintBusy) return
+    if (!pair || phase !== 'playing' || hintBusy || mode !== 'practice') return
     const current = path[path.length - 1]
     if (current === pair.end) return
     setHintBusy(true)
@@ -385,6 +624,7 @@ export default function PlayPage() {
         start: pair.start,
         end: pair.end,
         current,
+        path,
       })
       if (!data.next) {
         setError('No hint available from here.')
@@ -407,6 +647,11 @@ export default function PlayPage() {
 
   async function giveUp() {
     if (!pair || phase !== 'playing') return
+    // Bot mode: giving up forfeits the race to the bot.
+    if (mode === 'bot') {
+      finishBotRound('bot', path, true)
+      return
+    }
     try {
       const data = await postJson<{ par: number; optimalPath: string[] }>('/api/giveup', {
         start: pair.start,
@@ -435,6 +680,11 @@ export default function PlayPage() {
     setElapsed(0)
     startAtRef.current = null
     setPhase('playing')
+    if (mode === 'bot') {
+      if (botDifficultyRef.current) void startBotRound(botDifficultyRef.current)
+      else showBotPicker()
+      return
+    }
     if (mode === 'practice') {
       void loadPractice()
     } else if (daily) {
@@ -443,8 +693,10 @@ export default function PlayPage() {
     focusInput()
   }
 
-  function switchMode(next: 'daily' | 'practice') {
+  function switchMode(next: Mode) {
     if (next === mode) return
+    clearBotTimer()
+    resetBotRound()
     setMode(next)
     setPhase('playing')
     setResult(null)
@@ -456,7 +708,7 @@ export default function PlayPage() {
     startAtRef.current = null
     if (next === 'practice') {
       void loadPractice()
-    } else if (daily) {
+    } else if (next === 'daily' && daily) {
       setPath([daily.start])
     }
     focusInput()
@@ -489,6 +741,9 @@ export default function PlayPage() {
   const parRate =
     stats.played > 0 ? Math.round((stats.parHits / stats.played) * 100) : 0
   const solvingNow = mode === 'daily' && connected ? peers.length + 1 : null
+  const botWord = botPath.length > 0 ? botPath[Math.min(botIndex, botPath.length - 1)] : ''
+  const botPrevWord = botIndex > 0 && botPath.length > 0 ? botPath[botIndex - 1] : ''
+  const botChanged = botPrevWord ? diffIndex(botPrevWord, botWord) : -1
 
   return (
     <div className="mx-auto w-full max-w-3xl px-4 py-8">
@@ -529,10 +784,19 @@ export default function PlayPage() {
             >
               Practice
             </button>
+            <button
+              role="tab"
+              aria-selected={mode === 'bot'}
+              onClick={() => switchMode('bot')}
+              className={
+                mode === 'bot'
+                  ? 'rounded-full bg-primary px-3 py-1 font-medium text-primary-foreground'
+                  : 'rounded-full px-3 py-1 text-muted-foreground hover:text-foreground'
+              }
+            >
+              Bot
+            </button>
           </div>
-          <Button variant="outline" size="sm" onClick={() => setShowHood(true)}>
-            Under the Hood
-          </Button>
         </div>
       </div>
 
@@ -546,23 +810,59 @@ export default function PlayPage() {
       {loadError && (
         <div className="mb-4 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-foreground">
           {loadError}
-          <Button variant="outline" size="sm" className="ml-3" onClick={() => (mode === 'daily' ? void loadDaily() : void loadPractice())}>
+          <Button variant="outline" size="sm" className="ml-3" onClick={() => (mode === 'daily' ? void loadDaily() : mode === 'practice' ? void loadPractice() : botDifficultyRef.current ? void startBotRound(botDifficultyRef.current) : showBotPicker())}>
             Retry
           </Button>
         </div>
       )}
 
-      {!pair && !loadError && (
+      {/* Bot mode: difficulty picker (no round yet) */}
+      {mode === 'bot' && botPair === null && !botLoading && (
+        <div className="rounded-lg border border-border bg-card p-5">
+          <h2 className="text-lg font-semibold text-foreground">Race the bot</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Same start word, same target — first one there wins. Each race is a new random
+            ladder. Pick a difficulty:
+          </p>
+          <div className="mt-4 grid gap-3 sm:grid-cols-3">
+            {(['elementary', 'middle', 'high'] as const).map((level) => (
+              <button
+                key={level}
+                type="button"
+                onClick={() => void startBotRound(level)}
+                className={`rounded-lg border p-4 text-left transition-colors hover:border-primary ${
+                  botDifficulty === level ? 'border-primary bg-primary/5' : 'border-border bg-background'
+                }`}
+              >
+                <span className="block text-base font-semibold text-foreground">
+                  {BOT_LEVELS[level].label}
+                </span>
+                <span className="mt-1 block text-sm text-muted-foreground">
+                  {BOT_LEVELS[level].blurb}
+                </span>
+                <span className="mt-3 block text-sm font-medium text-primary">Race →</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {mode === 'bot' && botLoading && (
+        <p className="text-muted-foreground">Loading your race…</p>
+      )}
+
+      {!pair && !loadError && mode !== 'bot' && (
         <p className="text-muted-foreground">Loading today’s ladder…</p>
       )}
 
-      {pair && (
+      {pair && !botLoading && (
         <div className="grid gap-6 md:grid-cols-[1fr_240px]">
           <div>
             <p className="mb-3 text-sm text-muted-foreground">
               Turn <span className="font-mono font-bold text-foreground">{start.toUpperCase()}</span> into{' '}
               <span className="font-mono font-bold text-foreground">{end.toUpperCase()}</span>, one
               letter at a time. Every step must be a real word.
+              {mode === 'bot' && ' Beat the bot there.'}
             </p>
 
             {/* The ladder stack */}
@@ -585,7 +885,7 @@ export default function PlayPage() {
                         {word.split('').map((ch, j) => (
                           <span
                             key={j}
-                            className={`flex h-10 w-10 items-center justify-center rounded-md border text-lg font-bold uppercase ${
+                            className={`relative flex h-10 w-10 items-center justify-center rounded-md border text-lg font-bold uppercase ${
                               j === changed
                                 ? 'border-primary bg-primary text-primary-foreground'
                                 : isLast
@@ -594,6 +894,14 @@ export default function PlayPage() {
                             }`}
                           >
                             {ch}
+                            {isLast && j === changed && (
+                              <span
+                                className="absolute -right-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-amber-400 text-amber-950"
+                                title="Locked for the next rung"
+                              >
+                                <Lock className="h-2.5 w-2.5" strokeWidth={3} />
+                              </span>
+                            )}
                           </span>
                         ))}
                       </span>
@@ -668,10 +976,19 @@ export default function PlayPage() {
                     </>
                   )}
                 </div>
+                {lockedPos !== -1 && !error && (
+                  <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-amber-600">
+                    <Lock className="h-3 w-3" />
+                    Letter {lockedPos + 1} ({prevWord[lockedPos].toUpperCase()}) is locked for
+                    this rung — your next word must keep it.
+                  </p>
+                )}
                 <div className="mt-3 flex gap-2">
-                  <Button variant="outline" size="sm" onClick={() => void requestHint()} disabled={hintBusy}>
-                    Hint
-                  </Button>
+                  {mode === 'practice' && (
+                    <Button variant="outline" size="sm" onClick={() => void requestHint()} disabled={hintBusy}>
+                      Hint
+                    </Button>
+                  )}
                   <Button variant="outline" size="sm" onClick={() => void giveUp()}>
                     Give up
                   </Button>
@@ -757,6 +1074,55 @@ export default function PlayPage() {
               </div>
             )}
 
+            {phase === 'finished' && mode === 'bot' && botResult && (
+              <div className="mt-6 rounded-lg border border-border bg-card p-5">
+                <h2 className="text-lg font-semibold text-foreground">
+                  {botResult.winner === 'you'
+                    ? 'You beat the bot! 🎉'
+                    : botResult.gaveUp
+                      ? 'You gave up — the bot wins'
+                      : 'The bot beat you'}
+                </h2>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  You: {botResult.playerSteps} steps · {formatTime(botResult.playerSeconds)}
+                  {' · '}Bot: {botResult.botSteps} steps · {formatTime(botResult.botSeconds)}
+                  {' · '}Par {botResult.par}
+                </p>
+                <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                  <div>
+                    <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      Your path
+                    </h3>
+                    <ol className="space-y-0.5 font-mono text-sm">
+                      {path.map((w, i) => (
+                        <li key={i} className={i === 0 ? 'text-muted-foreground' : 'text-foreground'}>
+                          {i}. {w.toUpperCase()}
+                        </li>
+                      ))}
+                    </ol>
+                  </div>
+                  <div>
+                    <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      Bot’s path
+                    </h3>
+                    <ol className="space-y-0.5 font-mono text-sm">
+                      {botPath.map((w, i) => (
+                        <li key={i} className="text-foreground">
+                          {i}. {w.toUpperCase()}
+                        </li>
+                      ))}
+                    </ol>
+                  </div>
+                </div>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <Button onClick={playAgain}>Race again</Button>
+                  <Button variant="outline" onClick={showBotPicker}>
+                    Change difficulty
+                  </Button>
+                </div>
+              </div>
+            )}
+
             {phase === 'finished' && !result && pendingFinish && mode === 'daily' && (
               <div className="mt-6 rounded-lg border border-border bg-card p-5">
                 <h2 className="text-lg font-semibold text-foreground">
@@ -782,116 +1148,121 @@ export default function PlayPage() {
             )}
           </div>
 
-          {/* Sidebar: stats + leaderboard */}
+          {/* Sidebar */}
           <aside className="space-y-6">
-            <div className="rounded-lg border border-border bg-card p-4">
-              <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                Your stats
-              </h2>
-              <dl className="grid grid-cols-2 gap-3 text-sm">
-                <div>
-                  <dt className="text-muted-foreground">Streak</dt>
-                  <dd className="text-lg font-bold text-foreground">{stats.streak} 🔥</dd>
-                </div>
-                <div>
-                  <dt className="text-muted-foreground">Best streak</dt>
-                  <dd className="text-lg font-bold text-foreground">{stats.maxStreak}</dd>
-                </div>
-                <div>
-                  <dt className="text-muted-foreground">Days played</dt>
-                  <dd className="text-lg font-bold text-foreground">{stats.played}</dd>
-                </div>
-                <div>
-                  <dt className="text-muted-foreground">Par rate</dt>
-                  <dd className="text-lg font-bold text-foreground">{parRate}%</dd>
-                </div>
-              </dl>
-              <label className="mt-4 block text-xs font-medium text-muted-foreground">
-                Display name (for the leaderboard)
-                <Input
-                  value={name}
-                  onChange={(e) => setName(e.target.value.slice(0, 20))}
-                  placeholder="e.g. Maya"
-                  maxLength={20}
-                  className="mt-1 h-9"
-                />
-              </label>
-            </div>
-
-            <div className="rounded-lg border border-border bg-card p-4">
-              <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                Today’s board
-              </h2>
-              {!board ? (
-                <p className="text-sm text-muted-foreground">Loading…</p>
-              ) : board.length === 0 ? (
-                <p className="text-sm text-muted-foreground">No scores yet — be the first.</p>
-              ) : (
-                <ol className="space-y-1.5 text-sm">
-                  {board.slice(0, 10).map((entry, i) => {
-                    const mine = savedName !== null && entry.name === savedName
-                    return (
-                      <li
-                        key={`${entry.name}-${i}`}
-                        className={`flex items-baseline gap-2 rounded px-1.5 py-0.5 ${
-                          mine ? 'bg-primary/10 font-semibold text-foreground' : 'text-foreground'
-                        }`}
-                      >
-                        <span className="w-5 text-muted-foreground">{i + 1}.</span>
-                        <span className="flex-1 truncate">{entry.name}</span>
-                        <span className="text-muted-foreground">
-                          {entry.steps} steps · {formatTime(entry.seconds)}
+            {mode === 'bot' ? (
+              <div className="rounded-lg border border-border bg-card p-4">
+                <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Bot · {botDifficulty ? BOT_LEVELS[botDifficulty].label : ''}
+                </h2>
+                {botWord && (
+                  <>
+                    <div className="flex gap-1">
+                      {botWord.split('').map((ch, j) => (
+                        <span
+                          key={j}
+                          className={`flex h-9 w-9 items-center justify-center rounded-md border text-base font-bold uppercase ${
+                            j === botChanged
+                              ? 'border-primary bg-primary text-primary-foreground'
+                              : 'border-border bg-muted/50 text-foreground'
+                          }`}
+                        >
+                          {ch}
                         </span>
-                      </li>
-                    )
-                  })}
-                </ol>
-              )}
-            </div>
+                      ))}
+                    </div>
+                    <dl className="mt-3 space-y-1.5 text-sm">
+                      <div className="flex justify-between">
+                        <dt className="text-muted-foreground">Bot steps</dt>
+                        <dd className="font-bold text-foreground">{botIndex}</dd>
+                      </div>
+                      <div className="flex justify-between">
+                        <dt className="text-muted-foreground">Distance left</dt>
+                        <dd className="font-bold text-foreground">
+                          {botDistLeft === null ? '—' : `${botDistLeft} to go`}
+                        </dd>
+                      </div>
+                    </dl>
+                    {phase === 'playing' && (
+                      <p className="mt-3 flex items-center gap-1.5 text-xs text-muted-foreground">
+                        <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-emerald-500" />
+                        Bot is thinking…
+                      </p>
+                    )}
+                  </>
+                )}
+              </div>
+            ) : (
+              <>
+                <div className="rounded-lg border border-border bg-card p-4">
+                  <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    Your stats
+                  </h2>
+                  <dl className="grid grid-cols-2 gap-3 text-sm">
+                    <div>
+                      <dt className="text-muted-foreground">Streak</dt>
+                      <dd className="text-lg font-bold text-foreground">{stats.streak} 🔥</dd>
+                    </div>
+                    <div>
+                      <dt className="text-muted-foreground">Best streak</dt>
+                      <dd className="text-lg font-bold text-foreground">{stats.maxStreak}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-muted-foreground">Days played</dt>
+                      <dd className="text-lg font-bold text-foreground">{stats.played}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-muted-foreground">Par rate</dt>
+                      <dd className="text-lg font-bold text-foreground">{parRate}%</dd>
+                    </div>
+                  </dl>
+                  <label className="mt-4 block text-xs font-medium text-muted-foreground">
+                    Display name (for the leaderboard)
+                    <Input
+                      value={name}
+                      onChange={(e) => setName(e.target.value.slice(0, 20))}
+                      placeholder="e.g. Maya"
+                      maxLength={20}
+                      className="mt-1 h-9"
+                    />
+                  </label>
+                </div>
+
+                <div className="rounded-lg border border-border bg-card p-4">
+                  <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    Today’s board
+                  </h2>
+                  {!board ? (
+                    <p className="text-sm text-muted-foreground">Loading…</p>
+                  ) : board.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">No scores yet — be the first.</p>
+                  ) : (
+                    <ol className="space-y-1.5 text-sm">
+                      {board.slice(0, 10).map((entry, i) => {
+                        const mine = savedName !== null && entry.name === savedName
+                        return (
+                          <li
+                            key={`${entry.name}-${i}`}
+                            className={`flex items-baseline gap-2 rounded px-1.5 py-0.5 ${
+                              mine ? 'bg-primary/10 font-semibold text-foreground' : 'text-foreground'
+                            }`}
+                          >
+                            <span className="w-5 text-muted-foreground">{i + 1}.</span>
+                            <span className="flex-1 truncate">{entry.name}</span>
+                            <span className="text-muted-foreground">
+                              {entry.steps} steps · {formatTime(entry.seconds)}
+                            </span>
+                          </li>
+                        )
+                      })}
+                    </ol>
+                  )}
+                </div>
+              </>
+            )}
           </aside>
         </div>
       )}
-
-      <Modal open={showHood} onClose={() => setShowHood(false)} size="lg">
-        <Modal.Header>
-          <Modal.Title>Under the Hood</Modal.Title>
-          <Modal.Description>How Ladder works — no magic, just a graph and a search.</Modal.Description>
-        </Modal.Header>
-        <Modal.Body>
-          <div className="space-y-3 text-sm text-muted-foreground">
-            <p>
-              <strong className="text-foreground">The graph.</strong> Every valid 4-letter word is
-              a node. Two words are connected when they differ by exactly one letter. Instead of
-              comparing every pair, the server buckets words by wildcard pattern — COLD lives in
-              the buckets <code className="font-mono text-foreground">_OLD</code>,{' '}
-              <code className="font-mono text-foreground">C_LD</code>,{' '}
-              <code className="font-mono text-foreground">CO_D</code> and{' '}
-              <code className="font-mono text-foreground">COL_</code> — so its neighbours are just
-              the other words sharing a bucket. That turns a 7,000-word graph into a hash lookup.
-            </p>
-            <p>
-              <strong className="text-foreground">The par.</strong> A breadth-first search from the
-              start word finds the shortest path to the end word, and counts how many distinct
-              shortest paths exist. The daily puzzle is only shipped if its par is 4–6 steps with
-              at least two shortest paths, so there is never a single forced line. The par and the
-              optimal path are computed on the server and revealed only after you finish or give
-              up — your browser never sees them early.
-            </p>
-            <p>
-              <strong className="text-foreground">The daily.</strong> The puzzle for a UTC date is
-              deterministic: Ladder #N uses pair (N−1) mod 90 from a bank of 90 pre-validated pairs,
-              so everyone in the world gets the same ladder and the board is comparable.
-            </p>
-            <p>
-              <strong className="text-foreground">The board.</strong> Scores are validated
-              server-side (every rung checked against the dictionary and the one-letter rule) and
-              kept per (date, name) — unlimited retries, best result counts. The board is seeded
-              each morning with deterministic placeholder entries so it never looks empty on day
-              one.
-            </p>
-          </div>
-        </Modal.Body>
-      </Modal>
     </div>
   )
 }

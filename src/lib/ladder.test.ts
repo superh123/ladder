@@ -2,11 +2,13 @@
  * Ladder engine — unit tests.
  *
  * The engine is server-side only, so these run as plain vitest (no
- * worker, no DOM). They pin the three facts the game stands on:
- *   1. BFS finds the true shortest path (cold -> warm is par 4).
- *   2. Step validation reports the exact error for each bad move.
+ * worker, no DOM). They pin the facts the game stands on:
+ *   1. BFS finds the true shortest path under the lock rule (cold ->
+ *      warm is par 4; till -> lane is par 4).
+ *   2. Step validation reports the exact error for each bad move,
+ *      including the lock rule (no same position twice in a row).
  *   3. The daily pair is deterministic per date and every banked pair
- *      meets the par 4-6 / >= 2 shortest paths bar.
+ *      meets the par 4-6 / >= 2 shortest paths bar under the lock rule.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -14,13 +16,16 @@ import {
   bfs,
   dailyPairFor,
   diffIndex,
+  GUESS_BUCKETS,
   isGuessWord,
   isPresentableWord,
   ladderNumberFor,
+  mulberry32,
   nextStepOnShortestPath,
   preferredPath,
   validatePath,
   validateStep,
+  wanderingPath,
 } from './ladder'
 import { DAILY_PAIRS } from './daily-pairs'
 
@@ -28,7 +33,12 @@ describe('bfs', () => {
   it('cold -> warm is par 4 via wold, word, ward', () => {
     const { path, dist, pathCount } = bfs('cold', 'warm')
     expect(dist).toBe(4)
-    expect(path).toEqual(['cold', 'wold', 'word', 'ward', 'warm'])
+    expect(path).not.toBeNull()
+    expect(path![0]).toBe('cold')
+    expect(path![path!.length - 1]).toBe('warm')
+    expect(path!.length - 1).toBe(4)
+    // Whichever shortest path BFS reconstructs, it must obey the lock.
+    expect(validatePath('cold', 'warm', path!)).toEqual({ ok: true, steps: 4 })
     expect(pathCount).toBeGreaterThanOrEqual(1)
   })
 
@@ -45,7 +55,30 @@ describe('bfs', () => {
     expect(dist).toBe(-1)
   })
 
-  it('every banked daily pair meets the bar', () => {
+  it('till -> lane is still par 4 under the lock rule', () => {
+    const { path, dist, pathCount } = bfs('till', 'lane')
+    expect(dist).toBe(4)
+    expect(path).not.toBeNull()
+    expect(path![0]).toBe('till')
+    expect(path![path!.length - 1]).toBe('lane')
+    expect(path!.length - 1).toBe(4)
+    expect(validatePath('till', 'lane', path!)).toEqual({ ok: true, steps: 4 })
+    expect(pathCount).toBeGreaterThanOrEqual(2)
+  })
+
+  it('every BFS path obeys the lock rule', { timeout: 30_000 }, () => {
+    for (const [start, end] of DAILY_PAIRS) {
+      const { path } = bfs(start, end)
+      expect(path).not.toBeNull()
+      expect(validatePath(start, end, path!)).toEqual({
+        ok: true,
+        steps: path!.length - 1,
+      })
+    }
+  })
+
+  // Slow on purpose: a full constrained solve + clean-path check per pair.
+  it('every banked daily pair meets the bar', { timeout: 60_000 }, () => {
     expect(DAILY_PAIRS.length).toBeGreaterThanOrEqual(90)
     for (const [start, end] of DAILY_PAIRS) {
       const { dist, pathCount } = bfs(start, end)
@@ -82,6 +115,20 @@ describe('validateStep', () => {
     })
   })
 
+  it('rejects changing the locked position', () => {
+    // cold -> wold changed position 0, so the next rung may not touch it.
+    expect(validateStep('wold', 'gold', new Set(['cold', 'wold']), 0)).toEqual({
+      ok: false,
+      error: "That letter's locked for this rung",
+    })
+  })
+
+  it('accepts changing a different position while one is locked', () => {
+    expect(validateStep('wold', 'word', new Set(['cold', 'wold']), 0)).toEqual({
+      ok: true,
+    })
+  })
+
   it('rejects an already-used word', () => {
     expect(validateStep('cord', 'cold', new Set(['cold', 'cord']))).toEqual({
       ok: false,
@@ -96,6 +143,42 @@ describe('validatePath', () => {
       ok: true,
       steps: 4,
     })
+  })
+
+  it('accepts the canonical till -> lane solution', () => {
+    expect(
+      validatePath('till', 'lane', ['till', 'tile', 'tine', 'line', 'lane']),
+    ).toEqual({ ok: true, steps: 4 })
+  })
+
+  it('rejects a path that changes the same position twice in a row', () => {
+    // cold -> wold changed position 0; wold -> gold changes it again.
+    const result = validatePath('cold', 'warm', [
+      'cold',
+      'wold',
+      'gold',
+      'word',
+      'warm',
+    ])
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain("That letter's locked for this rung")
+    expect(result.error).toContain('step 3')
+  })
+
+  it('accepts the same position changing again after a different step', () => {
+    // Position 0 changes, then 1, then 0 again, then 1, then 0: legal,
+    // because the lock only ever covers the immediately previous step.
+    expect(
+      validatePath('cold', 'warm', [
+        'cold',
+        'wold',
+        'word',
+        'cord',
+        'card',
+        'ward',
+        'warm',
+      ]),
+    ).toEqual({ ok: true, steps: 6 })
   })
 
   it('rejects a path that does not end at the end word', () => {
@@ -116,6 +199,10 @@ describe('daily pairs', () => {
   it('is deterministic per date', () => {
     expect(dailyPairFor('2026-11-22')).toEqual(dailyPairFor('2026-11-22'))
     expect(dailyPairFor('2026-11-23')).not.toEqual(dailyPairFor('2026-11-22'))
+  })
+
+  it("today's pair is still till -> lane", () => {
+    expect(dailyPairFor('2026-11-23')).toEqual({ start: 'till', end: 'lane' })
   })
 
   it('numbers ladders from 1 on the epoch', () => {
@@ -139,8 +226,59 @@ describe('hints', () => {
     expect(bfs(next!, 'warm').dist).toBe(3)
   })
 
+  it('respects the locked position when hinting mid-ladder', () => {
+    // tile was reached by changing position 3, so the hint must not
+    // change position 3 again, and must still be on a shortest path.
+    const next = nextStepOnShortestPath('tile', 'lane', GUESS_BUCKETS, 3)
+    expect(next).not.toBeNull()
+    expect(diffIndex('tile', next!)).not.toBe(3)
+    expect(bfs(next!, 'lane', GUESS_BUCKETS, 3, diffIndex('tile', next!)).dist).toBe(
+      bfs('tile', 'lane', GUESS_BUCKETS, 3, 3).dist - 1,
+    )
+  })
+
   it('returns null at the end word', () => {
     expect(nextStepOnShortestPath('warm', 'warm')).toBeNull()
+  })
+})
+
+describe('wanderingPath', () => {
+  it('produces a legal path from start to end', () => {
+    const path = wanderingPath('cold', 'warm', {
+      greediness: 0.5,
+      random: mulberry32(42),
+    })
+    expect(path).not.toBeNull()
+    expect(path![0]).toBe('cold')
+    expect(path![path!.length - 1]).toBe('warm')
+    expect(validatePath('cold', 'warm', path!)).toEqual({
+      ok: true,
+      steps: path!.length - 1,
+    })
+    expect(path!.length - 1).toBeGreaterThanOrEqual(bfs('cold', 'warm').dist)
+  })
+
+  it('wanders further at low greediness', () => {
+    // Over several seeds, a low-greediness walk beats the par strictly
+    // more often than a high-greediness one — the bot's easy mode really
+    // is slower. (Checked as an aggregate, not per-seed, so a single
+    // lucky walk cannot flake the test.)
+    let lowExtra = 0
+    let highExtra = 0
+    for (let seed = 1; seed <= 8; seed++) {
+      const par = bfs('cold', 'warm').dist
+      const low = wanderingPath('cold', 'warm', {
+        greediness: 0.3,
+        random: mulberry32(seed),
+      })!
+      const high = wanderingPath('cold', 'warm', {
+        greediness: 0.95,
+        random: mulberry32(seed),
+      })!
+      lowExtra += low.length - 1 - par
+      highExtra += high.length - 1 - par
+    }
+    expect(lowExtra).toBeGreaterThan(highExtra)
   })
 })
 

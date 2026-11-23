@@ -18,6 +18,8 @@ import type { CronContext } from 'deepspace/worker'
 import {
   bfs,
   dailyPairFor,
+  diffIndex,
+  GUESS_BUCKETS,
   isValidDateStr,
   ladderNumberFor,
   nextStepOnShortestPath,
@@ -91,6 +93,8 @@ export function registerLadderRoutes(app: Hono<AppContext>): void {
 
   // Validate one proposed rung against the path so far.
   // Body: { start, end, path: string[] (including start), word }
+  // The lock rule is enforced from the path: the position changed on
+  // the previous step is locked for this one.
   app.post('/api/validate', async (c) => {
     const body = await readJson(c)
     const path = wordList(body.path)
@@ -99,14 +103,18 @@ export function registerLadderRoutes(app: Hono<AppContext>): void {
       return c.json({ ok: false, error: 'Not in dictionary' }, 400)
     }
     const prev = path[path.length - 1]
+    const locked =
+      path.length >= 2 ? diffIndex(path[path.length - 2], prev) : -1
     const used = new Set(path)
-    const check = validateStep(prev, word, used)
+    const check = validateStep(prev, word, used, locked)
     if (!check.ok) return c.json({ ok: false, error: check.error })
     return c.json({ ok: true })
   })
 
   // Next word on a shortest path from `current` to `end`.
-  // Body: { start, end, current }
+  // Body: { start, end, current, path?: string[] } — when the path is
+  // sent, the locked position is derived from its last two rungs so the
+  // hint never suggests changing a locked letter.
   app.post('/api/hint', async (c) => {
     const body = await readJson(c)
     const current = typeof body.current === 'string' ? body.current.toLowerCase() : ''
@@ -114,7 +122,14 @@ export function registerLadderRoutes(app: Hono<AppContext>): void {
     if (!/^[a-z]{4}$/.test(current) || !/^[a-z]{4}$/.test(end)) {
       return c.json({ next: null }, 400)
     }
-    return c.json({ next: nextStepOnShortestPath(current, end) })
+    const path = wordList(body.path)
+    const locked =
+      path.length >= 2
+        ? diffIndex(path[path.length - 2], path[path.length - 1])
+        : -1
+    return c.json({
+      next: nextStepOnShortestPath(current, end, GUESS_BUCKETS, locked),
+    })
   })
 
   // Reveal the par for a finished practice ladder (no persistence).
